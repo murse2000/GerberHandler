@@ -180,6 +180,7 @@ public partial class MainWindow : Window
     {
         mixedBoards = [];
         savedMixedBoards = null;
+        MapOuterCopper.IsChecked = false;
         RefreshMixedControls(-1);
         source = input;
         saved = null;
@@ -651,6 +652,7 @@ public partial class MainWindow : Window
         RowGap = ReadNumber(RowGap.Text),
         ColumnGap = ReadNumber(ColumnGap.Text),
         FillGaps = TabRouting.IsChecked != true && FillGaps.IsChecked == true,
+        MapTwoLayerBoardsToOuterCopper = MapOuterCopper.IsChecked == true,
         Routing = TabRouting.IsChecked == true ? new RoutingOptions(ReadNumber(RailChannel.Text), ReadNumber(CutterDiameter.Text),
             ReadNumber(TabWidth.Text), PositiveInteger(TabsPerEdge), ReadNumber(BiteDiameter.Text), ReadNumber(BitePitch.Text)) : null
     };
@@ -662,6 +664,7 @@ public partial class MainWindow : Window
         RowGap.Text = Number(options.RowGap);
         ColumnGap.Text = Number(options.ColumnGap);
         FillGaps.IsChecked = options.FillGaps;
+        MapOuterCopper.IsChecked = options.MapTwoLayerBoardsToOuterCopper;
         TabRouting.IsChecked = options.Routing is not null;
         if (options.Routing is { } routing)
         {

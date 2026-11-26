@@ -721,8 +721,8 @@ public sealed class PanelView : UserControl
         if (hasData)
         {
             var holes = VisibleLayers().Where(layer => layer.IsDrill).SelectMany(layer => layer.Shapes)
-                .Where(shape => ThroughHole(shape) && substrate.FillContains(FromCam(shape.Points[0])))
-                .DistinctBy(shape => (shape.Points[0], shape.Width)).ToArray();
+                .Where(shape => ThroughHole(shape) && shape.Points.All(point => substrate.FillContains(FromCam(point))))
+                .DistinctBy(shape => (shape.Points[0], shape.Points[^1], shape.Width)).ToArray();
             AddFace(nextScene, substrate, holes, top: true);
             AddFace(nextScene, substrate, holes, top: false);
             AddWalls(nextScene, holes);
@@ -799,7 +799,8 @@ public sealed class PanelView : UserControl
         model.Children.Add(new GeometryModel3D(mesh, material));
     }
 
-    private static bool ThroughHole(CamShape shape) => shape.Kind == "Drill" && shape.Points.Count == 1 && shape.Width > 0;
+    private static bool ThroughHole(CamShape shape) => (shape.Kind == "Drill" && shape.Points.Count == 1 ||
+        shape.Kind == "Slot" && shape.Points.Count == 2) && shape.Width > 0;
 
     private void AddWalls(Model3DGroup model, IReadOnlyList<CamShape> holes)
     {
@@ -816,6 +817,13 @@ public sealed class PanelView : UserControl
             var bores = new MeshGeometry3D();
             foreach (var hole in batch)
             {
+                if (hole.Kind == "Slot" && hole.Contours is { Count: > 0 } contours)
+                {
+                    foreach (var contour in contours)
+                        for (var index = 1; index < contour.Count; index++)
+                            AddWall(bores, FromCam(contour[index - 1]), FromCam(contour[index]));
+                    continue;
+                }
                 var center = FromCam(hole.Points[0]);
                 var radius = (double)hole.Width / 2;
                 const int sides = 24;

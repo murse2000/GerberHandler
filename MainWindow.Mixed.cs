@@ -181,10 +181,14 @@ public partial class MainWindow
         }
         Viewer.SetEditableBoards(boards, selection);
         Viewer.SetEditableFiducials(fiducials);
+        var mapped = output is not null && options.MapTwoLayerBoardsToOuterCopper &&
+            output.Files.Any(file => file.Role == "Copper,L4,Bot") &&
+            boards.Any(board => board.Input.Files.Any(file => file.Role == "Copper,L2,Bot"));
         var details = output is not null ? $"연결 탭 {output.Tabs}개 · 마우스바이트 {output.MouseBites}개"
             : route is not null ? $"미리보기 · 연결 탭 {route.TabCount}개 · 마우스바이트 {route.Bites.Count}개 · 제조 ZIP 저장 불가 · {issue}"
             : issue ?? "제조 ZIP을 만들려면 탭 라우팅을 선택하세요.";
-        StatusLabel.Text = $"혼합 {boards.Count}장 · {Size(panelBounds)} · {details}";
+        StatusLabel.Text = $"혼합 {boards.Count}장 · {Size(panelBounds)} · {details}" +
+            (mapped ? " · 4층 공통 적층 · 2층 보드 동박 L1/L4" : "");
     }
 
     private void LoadMixedProject(Project project, string path)

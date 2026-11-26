@@ -10,17 +10,26 @@ internal static class MixedCamFiles
 {
     private static readonly Regex CommentAttribute = new(@"^G04[ \t]+#@![ \t]+(T[FAOD](?:\.[^*]+)?\*)$");
     private const string DrillAttribute = "; #@! TA.AperFunction,";
+    private static readonly string[] TwoLayerCopper = ["Copper,L1,Top", "Copper,L2,Bot"];
+    private static readonly string[] FourLayerCopper = ["Copper,L1,Top", "Copper,L2,Inr", "Copper,L3,Inr", "Copper,L4,Bot"];
 
     internal static IReadOnlyList<CamFile> Merge(IReadOnlyList<MixedBoard> boards, PanelOptions options,
         IReadOnlyList<CamPoint> fiducials, IReadOnlyList<CamPoint> tooling, IReadOnlyList<CamPoint> bites)
     {
-        var copper = Roles(boards[0], "Copper,");
+        var stacks = boards.Select(board => Roles(board, "Copper,")).ToArray();
+        var outerOnly = options.MapTwoLayerBoardsToOuterCopper && stacks.Any(stack => stack.SequenceEqual(TwoLayerCopper)) &&
+            stacks.Any(stack => stack.SequenceEqual(FourLayerCopper)) &&
+            stacks.All(stack => stack.SequenceEqual(TwoLayerCopper) || stack.SequenceEqual(FourLayerCopper));
+        var copper = outerOnly ? FourLayerCopper : stacks[0];
         var masks = Roles(boards[0], "Soldermask,");
-        foreach (var board in boards.Skip(1))
+        for (var index = 0; index < boards.Count; index++)
         {
-            if (!Roles(board, "Copper,").SequenceEqual(copper))
+            var board = boards[index];
+            if (!outerOnly && !stacks[index].SequenceEqual(copper))
                 throw new InvalidDataException($"동박 스택 불일치 · {boards[0].Name} ({copper.Length}층) / " +
-                    $"{board.Name} ({Roles(board, "Copper,").Length}층). 혼합 제조 ZIP에는 같은 동박 스택이 필요합니다.");
+                    $"{board.Name} ({stacks[index].Length}층). " + (options.MapTwoLayerBoardsToOuterCopper
+                        ? "외층 매핑은 2층·4층 조합을 지원합니다."
+                        : "2층·4층 조합은 외층 매핑 옵션을 사용하세요."));
             if (!Roles(board, "Soldermask,").SequenceEqual(masks))
                 throw new InvalidDataException("혼합 제조 ZIP의 모든 보드는 같은 면의 솔더마스크 레이어가 필요합니다.");
         }
@@ -28,7 +37,9 @@ internal static class MixedCamFiles
             throw new InvalidDataException("피두셜을 만들려면 상면 솔더마스크가 필요합니다.");
 
         var files = new List<CamFile>();
-        var sources = boards.SelectMany((board, index) => board.Input.Files.Select(file => (File: file, Board: board, Index: index + 1)))
+        // 2층 보드는 외층 동박과 관통 드릴만 매핑한다. 내층 파일은 4층 보드에서만 가져온다.
+        var sources = boards.SelectMany((board, index) => board.Input.Files.Select(file =>
+                (File: outerOnly && stacks[index].Length == 2 ? MapOuterRole(file) : file, Board: board, Index: index + 1)))
             .Where(item => !item.File.Role.StartsWith("Profile", StringComparison.Ordinal) && item.File.Role != "Vcut");
         foreach (var layer in sources.Where(item => !item.File.IsDrill).GroupBy(item => item.File.Role))
             files.Add(MergeGerber(layer.Key, layer, options, fiducials));
@@ -41,6 +52,14 @@ internal static class MixedCamFiles
         }
         return files;
     }
+
+    private static CamFile MapOuterRole(CamFile file) => file.Role switch
+    {
+        "Copper,L2,Bot" => file with { Role = "Copper,L4,Bot" },
+        "Plated,1,2,PTH" => file with { Role = "Plated,1,4,PTH" },
+        "NonPlated,1,2,NPTH" => file with { Role = "NonPlated,1,4,NPTH" },
+        _ => file
+    };
 
     private static string[] Roles(MixedBoard board, string prefix) => board.Input.Files.Select(file => file.Role)
         .Where(role => role.StartsWith(prefix, StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToArray();
@@ -225,14 +244,14 @@ internal static class MixedCamFiles
             }
             foreach (var (id, diameter) in data.Tools)
                 AddTool(diameter, toolFunctions.GetValueOrDefault(id), data.Hits.Where(hit => hit.Id == id)
-                    .Select(hit => board.Transform(hit.Point)));
+                    .Select(hit => (board.Transform(hit.Point), hit.End is { } end ? (CamPoint?)board.Transform(end) : null)));
         }
-        AddTool(options.ToolingDiameter, "NonPlated,NPTH,MechanicalDrill,Tooling", tooling);
-        AddTool(options.Routing?.BiteDiameter ?? 0, "NonPlated,NPTH,MechanicalDrill", bites);
+        AddTool(options.ToolingDiameter, "NonPlated,NPTH,MechanicalDrill,Tooling", tooling.Select(point => (point, (CamPoint?)null)));
+        AddTool(options.Routing?.BiteDiameter ?? 0, "NonPlated,NPTH,MechanicalDrill", bites.Select(point => (point, (CamPoint?)null)));
         return new CamFile(plated ? "panel-PTH.drl" : "panel-NPTH.drl", role,
             header.AppendLine("%").AppendLine("G90").AppendLine("G05").Append(hits).AppendLine("M30").ToString(), true);
 
-        void AddTool(decimal diameter, string? function, IEnumerable<CamPoint> points)
+        void AddTool(decimal diameter, string? function, IEnumerable<(CamPoint Point, CamPoint? End)> points)
         {
             var toolPoints = points.ToArray();
             if (toolPoints.Length == 0)
@@ -244,7 +263,7 @@ internal static class MixedCamFiles
             header.AppendLine($"T{nextTool}C{DecimalText(diameter)}");
             hits.AppendLine($"T{nextTool++}");
             foreach (var coordinate in toolPoints)
-                hits.AppendLine($"X{DecimalText(coordinate.X)}Y{DecimalText(coordinate.Y)}");
+                WriteDrillHit(hits, coordinate.Point, coordinate.End);
         }
     }
 

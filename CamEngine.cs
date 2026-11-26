@@ -30,6 +30,7 @@ public sealed record PanelOptions(int Rows, int Columns, decimal RailLeft, decim
     public decimal RowGap { get; init; }
     public bool FillGaps { get; init; }
     public RoutingOptions? Routing { get; init; }
+    public bool MapTwoLayerBoardsToOuterCopper { get; init; }
 
     internal bool HasGap => Columns > 1 && ColumnGap > 0 || Rows > 1 && RowGap > 0;
     internal decimal PitchX(CamBounds bounds) => bounds.Width + ColumnGap;
@@ -108,7 +109,7 @@ public static class CamEngine
                 role = mappedRole;
             }
             if (drill && !ValidRole(role, true))
-                throw Bad($"{name}: PTH와 NPTH를 KiCad에서 분리해 내보내세요. 관통 원형 드릴을 지원합니다.");
+                throw Bad($"{name}: PTH와 NPTH를 KiCad에서 관통 드릴 파일로 분리해 내보내세요.");
             if (!drill && !ValidRole(role, false))
                 throw Bad($"{name}: 지원할 수 있는 레이어 역할을 파일에서 확인하지 못했습니다.");
             files.Add(new CamFile(name, role, source, drill));
@@ -817,13 +818,13 @@ public static class CamEngine
     internal static decimal Scale(int precision) => (decimal)Math.Pow(10, precision);
 
     internal sealed record DrillData(string[] Header, IReadOnlyDictionary<int, decimal> Tools,
-        IReadOnlyList<(int Id, CamPoint Point)> Hits);
+        IReadOnlyList<(int Id, CamPoint Point, CamPoint? End)> Hits);
 
     internal static DrillData ReadDrill(string source)
     {
         var lines = source.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
         var tools = new Dictionary<int, decimal>();
-        var hits = new List<(int, CamPoint)>();
+        var hits = new List<(int, CamPoint, CamPoint?)>();
         if (lines.Length < 4 || lines[0] != "M48" || lines[^1] != "M30")
             throw Bad("Excellon 헤더와 M30 종료가 필요합니다.");
         var headerEnd = Array.IndexOf(lines, "%");
@@ -854,22 +855,41 @@ public static class CamEngine
                 tool = index;
                 continue;
             }
-            var hit = Hit.Match(line);
-            if (!hit.Success || tool == 0)
-                throw Bad($"지원하지 않는 원형 드릴 명령입니다. {line}");
+            var coordinates = line.Split("G85", StringSplitOptions.None);
+            if (tool == 0 || coordinates.Length > 2)
+                throw Bad($"지원하지 않는 드릴 명령입니다. {line}");
+            var start = ReadPosition(coordinates[0]);
+            CamPoint? end = coordinates.Length == 2 ? ReadPosition(coordinates[1]) : null;
+            if (end == start)
+                throw Bad($"G85 장공 시작점과 끝점이 같습니다. {line}");
+            hits.Add((tool, start, end));
+        }
+        return new DrillData(lines[..headerEnd], tools, hits);
+
+        CamPoint ReadPosition(string coordinate)
+        {
+            var hit = Hit.Match(coordinate);
+            if (!hit.Success)
+                throw Bad($"지원하지 않는 드릴 좌표 또는 명령입니다. {coordinate}");
             var x = hit.Groups[1].Value;
             var y = hit.Groups[2].Value;
             if (!x.Contains('.') && !y.Contains('.') && !formatInHeader)
                 throw Bad("좌표 소수점 표기를 확인할 수 없습니다. KiCad에서 소수점 좌표와 전체 헤더로 내보내세요.");
-            hits.Add((tool, new CamPoint(Number(x), Number(y))));
+            return new CamPoint(Number(x), Number(y));
         }
-        return new DrillData(lines[..headerEnd], tools, hits);
     }
 
     private static List<CamShape> DrillGeometry(string source)
     {
         var data = ReadDrill(source);
-        return data.Hits.Select(hit => new CamShape("Drill", [hit.Point], data.Tools[hit.Id], data.Tools[hit.Id], true, true)).ToList();
+        return data.Hits.Select(hit =>
+        {
+            var diameter = data.Tools[hit.Id];
+            return hit.End is { } end
+                ? new CamShape("Slot", [hit.Point, end], diameter, diameter, true,
+                    Contours: [Hull(Disk(hit.Point, diameter / 2).Concat(Disk(end, diameter / 2)))])
+                : new CamShape("Drill", [hit.Point], diameter, diameter, true, true);
+        }).ToList();
     }
 
     private static string RepeatDrill(CamFile file, CamBounds bounds, PanelOptions options,
@@ -902,7 +922,12 @@ public static class CamEngine
             for (var column = 0; column < options.Columns; column++)
                 for (var row = 0; row < options.Rows; row++)
                     foreach (var hit in group)
-                        output.AppendLine(DrillPosition(new(hit.Point.X + column * options.PitchX(bounds), hit.Point.Y + row * options.PitchY(bounds))));
+                    {
+                        var x = column * options.PitchX(bounds);
+                        var y = row * options.PitchY(bounds);
+                        WriteDrillHit(output, new(hit.Point.X + x, hit.Point.Y + y),
+                            hit.End is { } end ? new CamPoint(end.X + x, end.Y + y) : null);
+                    }
         }
         for (var index = 0; index < additions.Count; index++)
         {
@@ -913,9 +938,17 @@ public static class CamEngine
         return output.AppendLine("M30").ToString();
     }
 
-    private static string DrillNumber(decimal value) => value.ToString("0.0##########", Invariant);
+    private static string DrillNumber(decimal value) => value.ToString("0.0###########################", Invariant);
 
     private static string DrillPosition(CamPoint point) => $"X{DrillNumber(point.X)}Y{DrillNumber(point.Y)}";
+
+    internal static void WriteDrillHit(StringBuilder output, CamPoint point, CamPoint? end)
+    {
+        if (end is { } target)
+            output.AppendLine($"{DrillPosition(point)}G85{DrillPosition(target)}").AppendLine("G05");
+        else
+            output.AppendLine(DrillPosition(point));
+    }
 
     private static string RepeatGerber(CamFile file, bool hasGeometry, CamBounds bounds, PanelOptions options, IReadOnlyList<CamPoint> marks)
     {

@@ -86,6 +86,7 @@
                             <TextBox x:Name="MixedGap" Text="5" Width="48" DockPanel.Dock="Right" />
                             <TextBlock Text="자동 정렬 간격 (mm)" VerticalAlignment="Center" />
                         </DockPanel>
+                        <CheckBox x:Name="MapOuterCopper" Content="2층 보드를 4층 패널의 외층에 배치" Click="RoutingModeChanged" Margin="0,0,0,5" />
                         <TextBlock Text="2D에서 보드를 클릭해 선택하고 끌어서 옮기세요." TextWrapping="Wrap" Margin="0,0,0,6" />
                         <Separator />
                     </StackPanel>

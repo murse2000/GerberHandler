@@ -104,8 +104,8 @@ public sealed class PanelView : UserControl
     internal void SetMixedOutput(IReadOnlyList<CamFile> files, CamBounds panel, CamBounds boards, PanelOptions options) =>
         SetData(files, panel, LayoutFillAreas(boards, boards, panel, options with { Rows = 1, Columns = 1, FillGaps = false }));
 
-    internal void SetMixedLayout(IReadOnlyList<MixedBoard> boards, CamBounds content, CamBounds panel, PanelOptions options,
-        IReadOnlyList<CamPoint> fiducials)
+    internal IReadOnlyList<CamFile> SetMixedLayout(IReadOnlyList<MixedBoard> boards, CamBounds content, CamBounds panel, PanelOptions options,
+        IReadOnlyList<CamPoint> fiducials, RoutedPanel? route)
     {
         var frame = LayoutFillAreas(content, content, panel, options with { Rows = 1, Columns = 1, FillGaps = false });
         var contours = new List<IReadOnlyList<CamPoint>>();
@@ -114,14 +114,33 @@ public sealed class PanelView : UserControl
             foreach (var file in board.Input.Files)
             {
                 var source = CamEngine.Geometry(file);
-                var translated = source.Select(shape => CamEngine.Translate(shape, board.Offset.X, board.Offset.Y)).ToArray();
+                var translated = source.Select(board.Transform).ToArray();
                 if (file.Role.StartsWith("Profile", StringComparison.Ordinal))
+                {
+                    if (route is not null)
+                        continue;
                     contours.AddRange(CamEngine.OutlineContours(translated));
+                }
                 if (!geometry.TryGetValue(file.Role, out var layer))
                     geometry.Add(file.Role, layer = (file, []));
                 layer.Shapes.AddRange(translated);
             }
-        contours.AddRange(frame.Select(RectangleContour));
+        if (route is not null)
+        {
+            // 레이어 병합에 실패해도 검증된 라우팅 외곽과 타공은 실제 좌표로 표시한다.
+            var profile = CamEngine.LineFile("라우팅 외곽 미리보기", "Profile,NP", route.Profile);
+            var shapes = CamEngine.Geometry(profile).ToList();
+            geometry.Add(profile.Role, (profile, shapes));
+            contours.AddRange(CamEngine.OutlineContours(shapes));
+            if (route.Bites.Count > 0)
+            {
+                var bites = new CamFile("비도금 타공 · 미리보기", "마우스바이트 미리보기", "", true);
+                var diameter = options.Routing!.BiteDiameter;
+                geometry.Add(bites.Role, (bites, route.Bites.Select(point => new CamShape("Drill", [point], diameter, diameter, true, true)).ToList()));
+            }
+        }
+        else
+            contours.AddRange(frame.Select(RectangleContour));
         if (geometry.TryGetValue("Copper,L1,Top", out var copper))
             copper.Shapes.AddRange(fiducials.Select(point => new CamShape("Flash", [point], options.FiducialDiameter,
                 options.FiducialDiameter, true, true, true)));
@@ -129,6 +148,7 @@ public sealed class PanelView : UserControl
             mask.Shapes.AddRange(fiducials.Select(point => new CamShape("Flash", [point], options.MaskDiameter, options.MaskDiameter, true, true)));
         var extent = ToRect(panel);
         ApplyData(extent, geometry.Values.Select(layer => BuildLayer(layer.File, layer.Shapes, extent)).ToArray(), contours, frame);
+        return geometry.Values.Select(layer => layer.File).ToArray();
     }
 
     private void SetData(IReadOnlyList<CamFile> files, CamBounds bounds, IReadOnlyList<CamBounds> fills)

@@ -39,7 +39,7 @@ internal static class MixedRouting
             }
 
             var outline = CamEngine.Geometry(board.Input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal)))
-                .Select(shape => CamEngine.Translate(shape, board.Offset.X, board.Offset.Y)).ToArray();
+                .Select(board.Transform).ToArray();
             var contour = CamEngine.OutlineContours(outline);
             if (contour.Count != 1)
                 throw new InvalidDataException("혼합 탭 라우팅은 단일 외곽의 PCB를 지원합니다.");

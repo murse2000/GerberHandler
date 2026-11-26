@@ -634,7 +634,8 @@ public partial class MainWindow : Window
     private CamInput RequireSource() => source ?? throw new InvalidDataException("단일 PCB Gerber를 먼저 여세요.");
 
     private Project Snapshot() => new(RequireSource().SourcePath, ReadOptions(), Presets.SelectedItem as Profile, roleOverrides,
-        mixedBoards.Count == 0 ? null : mixedBoards.Select(board => new MixedPlacement(board.Input.SourcePath, board.Origin, board.RoleOverrides)).ToArray(),
+        mixedBoards.Count == 0 ? null : mixedBoards.Select(board => new MixedPlacement(board.Input.SourcePath, board.Origin,
+            board.RoleOverrides, board.QuarterTurns)).ToArray(),
         mixedBoards.Count == 0 ? MixedPanel.DefaultGap : ReadMixedGap());
 
     private string SnapshotText() => JsonSerializer.Serialize(Snapshot(), JsonOptions);

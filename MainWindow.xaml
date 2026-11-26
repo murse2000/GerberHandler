@@ -76,8 +76,10 @@
                         <TextBlock Text="혼합 배치" FontSize="16" FontWeight="Bold" />
                         <ListBox x:Name="MixedBoardList" DisplayMemberPath="Caption" SelectionChanged="MixedSelectionChanged" MaxHeight="120" />
                         <WrapPanel>
+                            <Button Content="자동 배치" Click="AutoArrangeMixed" />
                             <Button Content="가로로 정렬" Click="ArrangeMixedHorizontal" />
                             <Button Content="세로로 정렬" Click="ArrangeMixedVertical" />
+                            <Button Content="시계 방향 90°" Click="RotateMixedBoard" />
                             <Button Content="선택 보드 제거" Click="RemoveMixedBoard" />
                         </WrapPanel>
                         <DockPanel Margin="0,0,0,5">
@@ -110,7 +112,7 @@
                         </CheckBox.Style>
                     </CheckBox>
                     <TextBlock Text="커넥터 등 부품이 돌출되면 필요한 간격을 입력하세요." TextWrapping="Wrap" Margin="0,0,0,5" />
-                    <CheckBox x:Name="TabRouting" Content="탭 라우팅 + 마우스바이트" Margin="0,2,0,5" />
+                    <CheckBox x:Name="TabRouting" Content="탭 라우팅 + 마우스바이트" Margin="0,2,0,5" Click="RoutingModeChanged" />
                     <UniformGrid Columns="2" Margin="0,0,0,6" IsEnabled="{Binding IsChecked, ElementName=TabRouting}">
                         <StackPanel Margin="0,0,8,0"><TextBlock Text="보드–레일 간격 (mm)" /><TextBox x:Name="RailChannel" Text="3" /></StackPanel>
                         <StackPanel><TextBlock Text="라우터 지름 (mm)" /><TextBox x:Name="CutterDiameter" Text="2" /></StackPanel>

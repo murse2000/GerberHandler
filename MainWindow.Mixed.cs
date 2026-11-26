@@ -56,6 +56,13 @@ public partial class MainWindow
 
     private void ArrangeMixedVertical(object sender, RoutedEventArgs e) => Run(() => ArrangeMixed(horizontal: false));
 
+    private void AutoArrangeMixed(object sender, RoutedEventArgs e) => Run(() =>
+    {
+        if (mixedBoards.Count > 1)
+            CommitMixed(MixedPanel.AutoArrange(mixedBoards, ReadMixedGap(), ReadOptions(), Presets.SelectedItem as Profile),
+                MixedBoardList.SelectedIndex);
+    });
+
     private void ArrangeMixed(bool horizontal)
     {
         if (mixedBoards.Count == 0)
@@ -92,6 +99,19 @@ public partial class MainWindow
         CommitMixed(next, index);
     });
 
+    private void RotateMixedBoard(object sender, RoutedEventArgs e) => Run(() =>
+    {
+        var index = MixedBoardList.SelectedIndex;
+        if (index < 0)
+        {
+            StatusLabel.Text = "2D 화면이나 혼합 배치 목록에서 회전할 보드를 선택하세요.";
+            return;
+        }
+        var next = mixedBoards.ToArray();
+        next[index] = next[index] with { QuarterTurns = (next[index].QuarterTurns + 1) % 4 };
+        CommitMixed(next, index);
+    });
+
     private void CommitMixed(IReadOnlyList<MixedBoard> next, int selection)
     {
         var options = ReadOptions();
@@ -121,6 +141,12 @@ public partial class MainWindow
 
     private void MixedSelectionChanged(object sender, SelectionChangedEventArgs e) => Viewer.SelectBoard(MixedBoardList.SelectedIndex);
 
+    private void RoutingModeChanged(object sender, RoutedEventArgs e)
+    {
+        if (mixedBoards.Count > 0)
+            Run(Preview);
+    }
+
     private void RenderMixed(IReadOnlyList<MixedBoard> boards, PanelOptions options, int selection, bool strictMarks = false)
     {
         var (bounds, panelBounds) = MixedPanel.Placement(boards, options);
@@ -129,9 +155,17 @@ public partial class MainWindow
         try { (fiducials, _) = MixedPanel.RailMarks(options, bounds, panelBounds); }
         catch (InvalidDataException error) when (!strictMarks) { issue = error.Message; }
         CamPanel? output = null;
-        if (options.Routing is not null && issue is null)
-            try { output = MixedPanel.Build(boards, options); }
-            catch (InvalidDataException error) { issue = error.Message; }
+        RoutedPanel? route = null;
+        if (options.Routing is { } routing)
+        {
+            try
+            {
+                route = MixedRouting.Build(boards, options, routing, bounds, panelBounds);
+                if (issue is null)
+                    output = MixedPanel.BuildWithRoute(boards, options, route);
+            }
+            catch (InvalidDataException error) { issue ??= error.Message; }
+        }
         if (output is not null)
         {
             Viewer.SetMixedOutput(output.Files, panelBounds, bounds, options);
@@ -140,14 +174,15 @@ public partial class MainWindow
         }
         else
         {
-            Viewer.SetMixedLayout(boards, bounds, panelBounds, options, fiducials);
-            ShowLayers("혼합 배치 미리보기", boards.SelectMany(board => board.Input.Files).ToArray(), panelBounds);
+            var layers = Viewer.SetMixedLayout(boards, bounds, panelBounds, options, fiducials, route);
+            ShowLayers(route is null ? "혼합 배치 미리보기" : "혼합 라우팅 미리보기", layers, panelBounds);
             if (issue is not null)
                 Findings.ItemsSource = new[] { new PanelFinding(issue, null) };
         }
         Viewer.SetEditableBoards(boards, selection);
         Viewer.SetEditableFiducials(fiducials);
         var details = output is not null ? $"연결 탭 {output.Tabs}개 · 마우스바이트 {output.MouseBites}개"
+            : route is not null ? $"미리보기 · 연결 탭 {route.TabCount}개 · 마우스바이트 {route.Bites.Count}개 · 제조 ZIP 저장 불가 · {issue}"
             : issue ?? "제조 ZIP을 만들려면 탭 라우팅을 선택하세요.";
         StatusLabel.Text = $"혼합 {boards.Count}장 · {Size(panelBounds)} · {details}";
     }
@@ -156,7 +191,8 @@ public partial class MainWindow
     {
         var boards = project.Boards!.Select(item => new MixedBoard(CamEngine.Load(item.SourcePath, item.RoleOverrides), item.Origin)
         {
-            RoleOverrides = item.RoleOverrides
+            RoleOverrides = item.RoleOverrides,
+            QuarterTurns = item.QuarterTurns
         }).ToArray();
         _ = MixedPanel.Placement(boards, project.Options);
         SetProfiles(project.Profile);
@@ -170,5 +206,5 @@ public partial class MainWindow
         cleanProject = SnapshotText();
     }
 
-    private sealed record MixedPlacement(string SourcePath, CamPoint Origin, IReadOnlyDictionary<string, string>? RoleOverrides);
+    private sealed record MixedPlacement(string SourcePath, CamPoint Origin, IReadOnlyDictionary<string, string>? RoleOverrides, int QuarterTurns = 0);
 }

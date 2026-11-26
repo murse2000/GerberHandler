@@ -19,7 +19,8 @@ internal static class MixedCamFiles
         foreach (var board in boards.Skip(1))
         {
             if (!Roles(board, "Copper,").SequenceEqual(copper))
-                throw new InvalidDataException("혼합 제조 ZIP의 모든 보드는 같은 동박 스택과 레이어 순서가 필요합니다.");
+                throw new InvalidDataException($"동박 스택 불일치 · {boards[0].Name} ({copper.Length}층) / " +
+                    $"{board.Name} ({Roles(board, "Copper,").Length}층). 혼합 제조 ZIP에는 같은 동박 스택이 필요합니다.");
             if (!Roles(board, "Soldermask,").SequenceEqual(masks))
                 throw new InvalidDataException("혼합 제조 ZIP의 모든 보드는 같은 면의 솔더마스크 레이어가 필요합니다.");
         }
@@ -27,7 +28,7 @@ internal static class MixedCamFiles
             throw new InvalidDataException("피두셜을 만들려면 상면 솔더마스크가 필요합니다.");
 
         var files = new List<CamFile>();
-        var sources = boards.SelectMany((board, index) => board.Input.Files.Select(file => (File: file, board.Offset, Index: index + 1)))
+        var sources = boards.SelectMany((board, index) => board.Input.Files.Select(file => (File: file, Board: board, Index: index + 1)))
             .Where(item => !item.File.Role.StartsWith("Profile", StringComparison.Ordinal) && item.File.Role != "Vcut");
         foreach (var layer in sources.Where(item => !item.File.IsDrill).GroupBy(item => item.File.Role))
             files.Add(MergeGerber(layer.Key, layer, options, fiducials));
@@ -44,7 +45,7 @@ internal static class MixedCamFiles
     private static string[] Roles(MixedBoard board, string prefix) => board.Input.Files.Select(file => file.Role)
         .Where(role => role.StartsWith(prefix, StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToArray();
 
-    private static CamFile MergeGerber(string role, IEnumerable<(CamFile File, CamPoint Offset, int Index)> items,
+    private static CamFile MergeGerber(string role, IEnumerable<(CamFile File, MixedBoard Board, int Index)> items,
         PanelOptions options, IReadOnlyList<CamPoint> fiducials)
     {
         var sources = items.Select(item =>
@@ -135,7 +136,7 @@ internal static class MixedCamFiles
                     definitions.AppendLine("%TD*%");
                     foreach (var attribute in attributes.Values)
                         definitions.AppendLine(attribute);
-                    definitions.AppendLine($"%ADD{assigned}{command[(aperture.Groups[1].Index + aperture.Groups[1].Length)..]}");
+                    definitions.AppendLine($"%ADD{assigned}{ApertureDefinition(aperture, item.Board)}*%");
                     definitions.AppendLine("%TD*%");
                     continue;
                 }
@@ -153,10 +154,15 @@ internal static class MixedCamFiles
                     y = g[3].Success ? Number(g[3].Value) / sy : y;
                     if (x is null || y is null)
                         throw Bad(item.File, "첫 Gerber 작업의 X/Y 좌표가 모두 필요합니다.");
-                    objects.Append(g[1].Value).Append('X').Append(Position(x.Value + item.Offset.X))
-                        .Append('Y').Append(Position(y.Value + item.Offset.Y));
-                    if (g[4].Success) objects.Append('I').Append(Position(Number(g[4].Value) / sx));
-                    if (g[5].Success) objects.Append('J').Append(Position(Number(g[5].Value) / sy));
+                    var point = item.Board.Transform(new CamPoint(x.Value, y.Value));
+                    objects.Append(g[1].Value).Append('X').Append(Position(point.X)).Append('Y').Append(Position(point.Y));
+                    if (g[4].Success || g[5].Success)
+                    {
+                        // I/J는 시작점에서 원호 중심까지의 벡터다. 회전해도 G02/G03 방향은 유지된다.
+                        var center = item.Board.RotateVector(new(g[4].Success ? Number(g[4].Value) / sx : 0,
+                            g[5].Success ? Number(g[5].Value) / sy : 0));
+                        objects.Append('I').Append(Position(center.X)).Append('J').Append(Position(center.Y));
+                    }
                     objects.AppendLine($"D0{g[6].Value}*");
                     continue;
                 }
@@ -188,7 +194,7 @@ internal static class MixedCamFiles
         return new CamFile($"panel-{role.Replace(',', '-')}.gbr", role, output.ToString(), false);
     }
 
-    private static CamFile MergeDrill(string role, IEnumerable<(CamFile File, CamPoint Offset, int Index)> sources,
+    private static CamFile MergeDrill(string role, IEnumerable<(CamFile File, MixedBoard Board, int Index)> sources,
         IReadOnlyList<CamPoint> tooling, IReadOnlyList<CamPoint> bites, PanelOptions options)
     {
         var plated = role.StartsWith("Plated,", StringComparison.Ordinal);
@@ -198,7 +204,7 @@ internal static class MixedCamFiles
             .AppendLine("FMAT,2").AppendLine("METRIC");
         var hits = new StringBuilder();
         var nextTool = 1;
-        foreach (var (file, offset, _) in sources)
+        foreach (var (file, board, _) in sources)
         {
             var data = ReadDrill(file.Text);
             var toolFunctions = new Dictionary<int, string>();
@@ -219,7 +225,7 @@ internal static class MixedCamFiles
             }
             foreach (var (id, diameter) in data.Tools)
                 AddTool(diameter, toolFunctions.GetValueOrDefault(id), data.Hits.Where(hit => hit.Id == id)
-                    .Select(hit => new CamPoint(hit.Point.X + offset.X, hit.Point.Y + offset.Y)));
+                    .Select(hit => board.Transform(hit.Point)));
         }
         AddTool(options.ToolingDiameter, "NonPlated,NPTH,MechanicalDrill,Tooling", tooling);
         AddTool(options.Routing?.BiteDiameter ?? 0, "NonPlated,NPTH,MechanicalDrill", bites);
@@ -240,6 +246,36 @@ internal static class MixedCamFiles
             foreach (var coordinate in toolPoints)
                 hits.AppendLine($"X{DecimalText(coordinate.X)}Y{DecimalText(coordinate.Y)}");
         }
+    }
+
+    private static string ApertureDefinition(Match aperture, MixedBoard board)
+    {
+        var name = aperture.Groups[2].Value;
+        var modifiers = aperture.Groups[3].Value;
+        if (board.QuarterTurns == 0 || name == "C" || modifiers.Length == 0)
+            return modifiers.Length == 0 ? name : $"{name},{modifiers}";
+
+        var values = modifiers.Split('X');
+        if ((name is "R" or "O") && board.QuarterTurns % 2 != 0)
+            (values[0], values[1]) = (values[1], values[0]);
+        else if (name == "P")
+        {
+            var angle = values.Length > 2 ? Number(values[2]) : 0;
+            var rotated = DecimalText((angle % 360 - board.QuarterTurns * 90 + 720) % 360);
+            if (values.Length == 2) values = [.. values, rotated];
+            else values[2] = rotated;
+        }
+        else if (name == "RoundRect")
+        {
+            // 검증된 KiCad 매크로의 사각 코너 중심 좌표를 아퍼처 원점 기준으로 회전한다.
+            for (var index = 1; index <= 7; index += 2)
+            {
+                var point = board.RotateVector(new(Number(values[index]), Number(values[index + 1])));
+                values[index] = DecimalText(point.X);
+                values[index + 1] = DecimalText(point.Y);
+            }
+        }
+        return $"{name},{string.Join('X', values)}";
     }
 
     private static int GroupInt(Match match, int group) => int.Parse(match.Groups[group].ValueSpan, CultureInfo.InvariantCulture);

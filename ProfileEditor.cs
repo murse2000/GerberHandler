@@ -8,6 +8,9 @@ internal sealed record Profile(string Name, string Source, DateOnly Date, decima
     decimal MinHeight, decimal MaxHeight, decimal MinRail, decimal Clearance, decimal FiducialDiameter,
     decimal MaskDiameter, decimal ToolingDiameter, decimal MinCutSpacing = 0)
 {
+    internal static Profile Reference { get; } = new("Eurocircuits 조립 · 공개 조건 참고", "Eurocircuits 조립 패널·동박 여유 가이드 참고",
+        new DateOnly(2026, 11, 26), 36, 326, 46, 426, 5, .45m, 1.5m, 3, 3, 5);
+
     public IEnumerable<PanelFinding> Validate(CamPanel panel, PanelOptions options)
     {
         if (options.Routing is null && options.HasGap && MinCutSpacing <= 0)
@@ -50,7 +53,7 @@ internal sealed record Profile(string Name, string Source, DateOnly Date, decima
 
 internal static class ProfileEditor
 {
-    public static Profile? Show(Window owner)
+    public static Profile? Show(Window owner, string currentFiducial, string currentMask, string currentTooling)
     {
         var form = new StackPanel { Margin = new Thickness(16) };
         var dialog = new Window
@@ -63,6 +66,13 @@ internal static class ProfileEditor
             Width = 490,
             Content = new ScrollViewer { Content = form, VerticalScrollBarVisibility = ScrollBarVisibility.Auto }
         };
+        var shortcuts = new WrapPanel();
+        var referenceButton = new Button { Content = "공개 조건 불러오기" };
+        var marksButton = new Button { Content = "현재 마크 치수 사용" };
+        shortcuts.Children.Add(referenceButton);
+        shortcuts.Children.Add(marksButton);
+        form.Children.Add(shortcuts);
+        form.Children.Add(new TextBlock { Text = "공개 조건은 Eurocircuits 참고값입니다. 주문할 업체의 규격을 확인해 저장하세요.", TextWrapping = TextWrapping.Wrap });
         var name = AddField("프리셋 이름");
         var source = AddField("확인한 제조사 문서 또는 사내 기준");
         var minWidth = AddField("최소 패널 가로 (mm)");
@@ -75,6 +85,14 @@ internal static class ProfileEditor
         var fiducial = AddField("피두셜 동박 지름 (mm)");
         var mask = AddField("피두셜 마스크 개구 지름 (mm)");
         var tooling = AddField("고정 홀 지름 (mm)");
+        FillReference();
+        referenceButton.Click += (_, _) => FillReference();
+        marksButton.Click += (_, _) =>
+        {
+            fiducial.Text = currentFiducial;
+            mask.Text = currentMask;
+            tooling.Text = currentTooling;
+        };
         var error = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = System.Windows.Media.Brushes.DarkRed };
         form.Children.Add(error);
         var save = new Button { Content = "확인한 조건 저장", IsDefault = true, HorizontalAlignment = HorizontalAlignment.Right };
@@ -104,6 +122,23 @@ internal static class ProfileEditor
 
         dialog.ShowDialog();
         return result;
+
+        void FillReference()
+        {
+            var profile = Profile.Reference;
+            name.Text = "내 제조·조립 조건";
+            source.Text = profile.Source;
+            minWidth.Text = MainWindow.Number(profile.MinWidth);
+            maxWidth.Text = MainWindow.Number(profile.MaxWidth);
+            minHeight.Text = MainWindow.Number(profile.MinHeight);
+            maxHeight.Text = MainWindow.Number(profile.MaxHeight);
+            rail.Text = MainWindow.Number(profile.MinRail);
+            clearance.Text = MainWindow.Number(profile.Clearance);
+            cutSpacing.Text = MainWindow.Number(profile.MinCutSpacing);
+            fiducial.Text = MainWindow.Number(profile.FiducialDiameter);
+            mask.Text = MainWindow.Number(profile.MaskDiameter);
+            tooling.Text = MainWindow.Number(profile.ToolingDiameter);
+        }
 
         TextBox AddField(string label)
         {

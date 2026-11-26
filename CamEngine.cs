@@ -203,7 +203,7 @@ public static class CamEngine
             }
         }
 
-        var railLimit = options.Routing is { } railRouting ? Expand(boards, railRouting.RailChannel) : boards;
+        var railLimit = RailLimit(boards, options);
         var markCuts = routed is null ? cuts : Cuts(railLimit, panel, options with { Rows = 1, Columns = 1 });
         var marks = new List<(CamPoint Point, decimal Radius)>();
         var fiducials = options.Fiducials ? Marks(panel, railLimit, markCuts, options.CutClearance,
@@ -213,7 +213,7 @@ public static class CamEngine
         var npthTools = new List<(decimal Diameter, IReadOnlyList<CamPoint> Points, bool Tooling)>();
         if (tooling.Count > 0)
             npthTools.Add((options.ToolingDiameter, tooling, true));
-        if (routed is not null)
+        if (routed is { Bites.Count: > 0 })
             npthTools.Add((options.Routing!.BiteDiameter, routed.Bites, false));
         var files = new List<CamFile>();
         foreach (var (file, geometry) in shapes)
@@ -261,7 +261,7 @@ public static class CamEngine
         var source = input.Bounds;
         var boards = source with { MaxX = source.MaxX + (options.Columns - 1) * options.PitchX(source),
             MaxY = source.MaxY + (options.Rows - 1) * options.PitchY(source) };
-        var railLimit = Expand(boards, options.Routing?.RailChannel ?? 0);
+        var railLimit = RailLimit(boards, options);
         var panel = new CamBounds(railLimit.MinX - options.RailLeft, railLimit.MinY - options.RailBottom,
             railLimit.MaxX + options.RailRight, railLimit.MaxY + options.RailTop);
         if (panel.Width > 10000 || panel.Height > 10000)
@@ -271,8 +271,12 @@ public static class CamEngine
         return (boards, panel);
     }
 
-    internal static CamBounds Expand(CamBounds bounds, decimal amount) =>
-        new(bounds.MinX - amount, bounds.MinY - amount, bounds.MaxX + amount, bounds.MaxY + amount);
+    internal static CamBounds RailLimit(CamBounds bounds, PanelOptions options)
+    {
+        var channel = options.Routing?.RailChannel ?? 0;
+        return new(bounds.MinX - (options.RailLeft > 0 ? channel : 0), bounds.MinY - (options.RailBottom > 0 ? channel : 0),
+            bounds.MaxX + (options.RailRight > 0 ? channel : 0), bounds.MaxY + (options.RailTop > 0 ? channel : 0));
+    }
 
     internal static string? VCutOutlineProblem(CamInput input) => RectangleProblem(
         Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal))));

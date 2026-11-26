@@ -33,6 +33,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        Viewer.FiducialsMoved += MoveFiducials;
         Run(() =>
         {
             if (File.Exists(PresetPath))
@@ -281,7 +282,9 @@ public partial class MainWindow : Window
 
     private void BuildPanel(object sender, RoutedEventArgs e) => Run(Preview);
 
-    private void Preview()
+    private void Preview() => RenderPreview(strictMarks: false);
+
+    private void RenderPreview(bool strictMarks)
     {
         var project = Snapshot();
         var input = RequireSource();
@@ -292,8 +295,9 @@ public partial class MainWindow : Window
             IReadOnlyList<CamPoint> fiducials = [];
             string? markProblem = null;
             try { fiducials = CamEngine.LayoutFiducials(input, boards, layoutBounds, project.Options); }
-            catch (InvalidDataException e) { markProblem = e.Message; }
+            catch (InvalidDataException e) when (!strictMarks) { markProblem = e.Message; }
             Viewer.SetLayout(input, project.Options, boards, layoutBounds, fiducials);
+            Viewer.SetEditableFiducials(fiducials);
             ShowLayers("배열 미리보기", input.Files, layoutBounds);
             StatusLabel.Text = $"{project.Options.Rows * project.Options.Columns}장 · {Size(layoutBounds)} · " +
                 (problem ?? "열린 간격의 제조 ZIP에는 탭 라우팅이 필요합니다.");
@@ -304,12 +308,25 @@ public partial class MainWindow : Window
 
         var panel = CamEngine.Build(input, project.Options);
         ShowPanel("편집 중인 패널", panel, input, project.Options);
+        Viewer.SetEditableFiducials(panel.Fiducials);
         SetChecks(panel, project.Profile, false);
         var marks = string.Join(" / ", panel.Fiducials.Select(p => $"({Number(p.X)}, {Number(p.Y)})"));
         StatusLabel.Text = $"{project.Options.Rows * project.Options.Columns}장 · {Size(panel.Bounds)}" +
             (panel.Tabs == 0 ? "" : $" · 연결 탭 {panel.Tabs}개 · 마우스바이트 {panel.MouseBites}개") +
             (marks.Length == 0 ? "" : $" · 피두셜 {marks}");
     }
+
+    private void MoveFiducials(IReadOnlyList<CamPoint> points) => Run(() =>
+    {
+        var previous = FiducialPositions.Text;
+        FiducialPositions.Text = FormatPositions(points);
+        try { RenderPreview(strictMarks: true); }
+        catch
+        {
+            FiducialPositions.Text = previous;
+            throw;
+        }
+    });
 
     private void SavePanel(object sender, RoutedEventArgs e) => Run(() =>
     {
@@ -512,7 +529,7 @@ public partial class MainWindow : Window
 
     private void CreatePreset(object sender, RoutedEventArgs e) => Run(() =>
     {
-        var profile = ProfileEditor.Show(this);
+        var profile = ProfileEditor.Show(this, FiducialDiameter.Text, MaskDiameter.Text, ToolingDiameter.Text);
         if (profile is null)
             return;
 
@@ -528,6 +545,7 @@ public partial class MainWindow : Window
     private void SetProfiles(Profile? selected)
     {
         var choices = profiles.ToList();
+        choices.Insert(0, Profile.Reference);
         if (selected is not null && !choices.Contains(selected))
             choices.Add(selected);
         Presets.ItemsSource = choices;
@@ -576,7 +594,8 @@ public partial class MainWindow : Window
     private string SnapshotText() => JsonSerializer.Serialize(Snapshot(), JsonOptions);
 
     private PanelOptions ReadOptions() => new(PositiveInteger(Rows), PositiveInteger(Columns),
-        ReadNumber(RailLeft.Text), ReadNumber(RailRight.Text), ReadNumber(RailBottom.Text), ReadNumber(RailTop.Text),
+        ReadRail(EnableLeftRail, RailLeft), ReadRail(EnableRightRail, RailRight),
+        ReadRail(EnableBottomRail, RailBottom), ReadRail(EnableTopRail, RailTop),
         Fiducials.IsChecked == true, ReadNumber(FiducialDiameter.Text), ReadNumber(MaskDiameter.Text),
         Tooling.IsChecked == true, ReadNumber(ToolingDiameter.Text), (Presets.SelectedItem as Profile)?.Clearance ?? 0m)
     {
@@ -606,10 +625,10 @@ public partial class MainWindow : Window
             BiteDiameter.Text = Number(routing.BiteDiameter);
             BitePitch.Text = Number(routing.BitePitch);
         }
-        RailLeft.Text = Number(options.RailLeft);
-        RailRight.Text = Number(options.RailRight);
-        RailBottom.Text = Number(options.RailBottom);
-        RailTop.Text = Number(options.RailTop);
+        SetRail(EnableLeftRail, RailLeft, options.RailLeft);
+        SetRail(EnableRightRail, RailRight, options.RailRight);
+        SetRail(EnableBottomRail, RailBottom, options.RailBottom);
+        SetRail(EnableTopRail, RailTop, options.RailTop);
         Fiducials.IsChecked = options.Fiducials;
         FiducialDiameter.Text = Number(options.FiducialDiameter);
         MaskDiameter.Text = Number(options.MaskDiameter);
@@ -617,6 +636,14 @@ public partial class MainWindow : Window
         ToolingDiameter.Text = Number(options.ToolingDiameter);
         FiducialPositions.Text = FormatPositions(options.FiducialPositions);
         ToolingPositions.Text = FormatPositions(options.ToolingPositions);
+    }
+
+    private static decimal ReadRail(CheckBox enabled, TextBox size) => enabled.IsChecked == true ? ReadNumber(size.Text) : 0;
+
+    private static void SetRail(CheckBox enabled, TextBox size, decimal value)
+    {
+        enabled.IsChecked = value != 0;
+        size.Text = value == 0 ? "5" : Number(value);
     }
 
     internal static decimal ReadNumber(string text) =>

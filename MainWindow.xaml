@@ -75,10 +75,10 @@
                         <StackPanel><TextBlock Text="열 (X)" /><TextBox x:Name="Columns" Text="1" /></StackPanel>
                         <StackPanel Margin="0,0,8,0"><TextBlock Text="행 간격 (mm)" /><TextBox x:Name="RowGap" Text="0" /></StackPanel>
                         <StackPanel><TextBlock Text="열 간격 (mm)" /><TextBox x:Name="ColumnGap" Text="0" /></StackPanel>
-                        <StackPanel Margin="0,0,8,0"><TextBlock Text="왼쪽 레일 (mm)" /><TextBox x:Name="RailLeft" Text="5" /></StackPanel>
-                        <StackPanel><TextBlock Text="오른쪽 레일 (mm)" /><TextBox x:Name="RailRight" Text="5" /></StackPanel>
-                        <StackPanel Margin="0,0,8,0"><TextBlock Text="아래 레일 (mm)" /><TextBox x:Name="RailBottom" Text="5" /></StackPanel>
-                        <StackPanel><TextBlock Text="위 레일 (mm)" /><TextBox x:Name="RailTop" Text="5" /></StackPanel>
+                        <StackPanel Margin="0,0,8,0"><CheckBox x:Name="EnableLeftRail" Content="왼쪽 레일 (mm)" IsChecked="True" /><TextBox x:Name="RailLeft" Text="5" IsEnabled="{Binding IsChecked, ElementName=EnableLeftRail}" /></StackPanel>
+                        <StackPanel><CheckBox x:Name="EnableRightRail" Content="오른쪽 레일 (mm)" IsChecked="True" /><TextBox x:Name="RailRight" Text="5" IsEnabled="{Binding IsChecked, ElementName=EnableRightRail}" /></StackPanel>
+                        <StackPanel Margin="0,0,8,0"><CheckBox x:Name="EnableBottomRail" Content="아래 레일 (mm)" IsChecked="True" /><TextBox x:Name="RailBottom" Text="5" IsEnabled="{Binding IsChecked, ElementName=EnableBottomRail}" /></StackPanel>
+                        <StackPanel><CheckBox x:Name="EnableTopRail" Content="위 레일 (mm)" IsChecked="True" /><TextBox x:Name="RailTop" Text="5" IsEnabled="{Binding IsChecked, ElementName=EnableTopRail}" /></StackPanel>
                     </UniformGrid>
                     <CheckBox x:Name="FillGaps" Content="간격을 빈 PCB로 채우기" Margin="0,0,0,5">
                         <CheckBox.Style>
@@ -113,7 +113,7 @@
                     <TextBox x:Name="ToolingDiameter" Text="2" />
                     <Expander Header="마크 좌표 직접 지정" Margin="0,6">
                         <StackPanel>
-                            <TextBlock Text="좌표는 mm 단위로 한 줄에 X Y를 입력합니다. 빈 경우 자동 배치합니다." TextWrapping="Wrap" />
+                            <TextBlock Text="2D에서 피두셜을 끌면 1 mm씩 이동합니다. 좌표를 직접 입력하려면 한 줄에 X Y를 쓰세요. 빈 경우 자동 배치합니다." TextWrapping="Wrap" />
                             <TextBlock Text="피두셜 좌표" Margin="0,5,0,0" />
                             <TextBox x:Name="FiducialPositions" AcceptsReturn="True" Height="55" VerticalScrollBarVisibility="Auto" />
                             <TextBlock Text="고정 홀 좌표" />

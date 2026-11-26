@@ -11,13 +11,13 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
     internal static RoutedPanel Build(CamInput input, PanelOptions options, RoutingOptions dimensions, CamBounds boards, CamBounds panel)
     {
         var source = input.Bounds;
-        var channels = new List<decimal> { dimensions.RailChannel };
+        var hasRails = options.RailLeft > 0 || options.RailRight > 0 || options.RailBottom > 0 || options.RailTop > 0;
+        var channels = new List<decimal>();
         if (options.Columns > 1) channels.Add(options.ColumnGap);
         if (options.Rows > 1) channels.Add(options.RowGap);
-        if (dimensions.CutterDiameter <= 0 || channels.Any(gap => gap <= dimensions.CutterDiameter))
+        if (dimensions.CutterDiameter <= 0 || channels.Any(gap => gap <= dimensions.CutterDiameter) ||
+            hasRails && dimensions.RailChannel <= dimensions.CutterDiameter)
             throw new InvalidDataException("보드 사이 및 외곽 레일의 가공 간격을 라우터 공구 지름보다 크게 입력하세요.");
-        if (new[] { options.RailLeft, options.RailRight, options.RailBottom, options.RailTop }.Any(width => width <= 0))
-            throw new InvalidDataException("탭 라우팅에는 네 방향의 가이드 레일이 필요합니다.");
         if (dimensions.TabsPerEdge is < 1 or > 10 || dimensions.TabWidth <= 0 || dimensions.BiteDiameter <= 0 ||
             dimensions.BitePitch <= dimensions.BiteDiameter ||
             (dimensions.TabWidth / 2 - dimensions.BiteDiameter) / dimensions.BitePitch is < 1 or >= 13)
@@ -28,7 +28,7 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
 
         var radius = dimensions.BiteDiameter / 2;
         var offset = radius + options.CutClearance;
-        if (dimensions.RailChannel <= offset + radius || channels.Skip(1).Any(gap => gap - 2 * offset <= dimensions.BiteDiameter))
+        if (hasRails && dimensions.RailChannel <= offset + radius || channels.Any(gap => gap - 2 * offset <= dimensions.BiteDiameter))
             throw new InvalidDataException("두 보드 쪽 마우스바이트가 겹치지 않도록 가공 간격을 늘리세요.");
 
         var outline = CamEngine.Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal)));
@@ -39,11 +39,11 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
         var material = new Paths64();
         var bites = new List<CamPoint>();
         var tabs = 0;
-        var rail = CamEngine.Expand(boards, dimensions.RailChannel);
-        material.Add(Rectangle(panel.MinX, panel.MinY, rail.MinX, panel.MaxY));
-        material.Add(Rectangle(rail.MaxX, panel.MinY, panel.MaxX, panel.MaxY));
-        material.Add(Rectangle(rail.MinX, panel.MinY, rail.MaxX, rail.MinY));
-        material.Add(Rectangle(rail.MinX, rail.MaxY, rail.MaxX, panel.MaxY));
+        var rail = CamEngine.RailLimit(boards, options);
+        if (options.RailLeft > 0) material.Add(Rectangle(panel.MinX, panel.MinY, rail.MinX, panel.MaxY));
+        if (options.RailRight > 0) material.Add(Rectangle(rail.MaxX, panel.MinY, panel.MaxX, panel.MaxY));
+        if (options.RailBottom > 0) material.Add(Rectangle(rail.MinX, panel.MinY, rail.MaxX, rail.MinY));
+        if (options.RailTop > 0) material.Add(Rectangle(rail.MinX, rail.MaxY, rail.MaxX, panel.MaxY));
 
         var left = EdgeRanges(vertical: true, source.MinX);
         var right = EdgeRanges(vertical: true, source.MaxX);
@@ -57,24 +57,26 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
                 var dx = column * options.PitchX(source);
                 var dy = row * options.PitchY(source);
                 material.Add(Clipper.TranslatePath(shape, Scale(dx), Scale(dy)));
-                if (column == 0) AddTabs(true, rail.MinX, source.MinX, dy, left, false, true);
-                if (column + 1 == options.Columns) AddTabs(true, source.MaxX + dx, rail.MaxX, dy, right, true, false);
-                else AddTabs(true, source.MaxX + dx, source.MinX + dx + options.PitchX(source), dy, betweenColumns, true, true);
-                if (row == 0) AddTabs(false, rail.MinY, source.MinY, dx, bottom, false, true);
-                if (row + 1 == options.Rows) AddTabs(false, source.MaxY + dy, rail.MaxY, dx, top, true, false);
-                else AddTabs(false, source.MaxY + dy, source.MinY + dy + options.PitchY(source), dx, betweenRows, true, true);
+                if (column == 0 && options.RailLeft > 0) AddTabs(true, rail.MinX, source.MinX, dy, left, false, true);
+                if (column + 1 < options.Columns) AddTabs(true, source.MaxX + dx, source.MinX + dx + options.PitchX(source), dy, betweenColumns, true, true);
+                else if (options.RailRight > 0) AddTabs(true, source.MaxX + dx, rail.MaxX, dy, right, true, false);
+                if (row == 0 && options.RailBottom > 0) AddTabs(false, rail.MinY, source.MinY, dx, bottom, false, true);
+                if (row + 1 < options.Rows) AddTabs(false, source.MaxY + dy, source.MinY + dy + options.PitchY(source), dx, betweenRows, true, true);
+                else if (options.RailTop > 0) AddTabs(false, source.MaxY + dy, rail.MaxY, dx, top, true, false);
             }
 
         var outer = new Paths64 { Rectangle(panel.MinX, panel.MinY, panel.MaxX, panel.MaxY) };
-        var desiredOpenings = Clipper.Difference(outer, Clipper.Union(material, FillRule.NonZero), FillRule.NonZero);
+        var boardMaterial = Clipper.Union(material, FillRule.NonZero);
+        var desiredOpenings = Clipper.Difference(outer, boardMaterial, FillRule.NonZero);
         var cutterRadius = (double)(dimensions.CutterDiameter * UnitsPerMm / 2);
         // 공구 중심이 지나갈 수 있는 영역을 구해 탭 옆의 가공 불가능한 날카로운 모서리를 둥글린다.
-        var toolPaths = Clipper.InflatePaths(desiredOpenings, -cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance);
-        var openings = Clipper.Intersect(desiredOpenings,
-            Clipper.InflatePaths(toolPaths, cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance), FillRule.NonZero);
-        if (desiredOpenings.Count == 0 || toolPaths.Count != desiredOpenings.Count || openings.Count != desiredOpenings.Count)
+        // 선택하지 않은 레일 쪽에서는 공구가 바깥으로 나갈 수 있도록 소재 자체를 오프셋한다.
+        var rounded = Clipper.InflatePaths(Clipper.InflatePaths(boardMaterial, cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance),
+            -cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance);
+        var result = Clipper.Intersect(outer, Clipper.Union(boardMaterial, rounded, FillRule.NonZero), FillRule.NonZero);
+        var openings = Clipper.Difference(outer, result, FillRule.NonZero);
+        if (openings.Count != desiredOpenings.Count)
             throw new InvalidDataException("설정한 공구로 가공할 수 없는 통로가 있습니다. 가공 간격이나 탭 위치 조건을 확인하세요.");
-        var result = Clipper.Difference(outer, openings, FillRule.NonZero);
         if (result.Count(path => Clipper.IsPositive(path)) != 1)
             throw new InvalidDataException("라우팅 후 패널이 한 장으로 연결되지 않습니다.");
         var holeClearance = Clipper.InflatePaths(openings, (double)(radius * UnitsPerMm) + ArcTolerance,

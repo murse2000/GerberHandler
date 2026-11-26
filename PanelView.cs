@@ -40,6 +40,10 @@ public sealed class PanelView : UserControl
     private Vector pan;
     private Point? dragStart;
     private Vector dragOffset;
+    private IReadOnlyList<CamPoint> editableFiducials = [];
+    private int draggedFiducial = -1;
+    private CamPoint? dragTarget;
+    internal event Action<IReadOnlyList<CamPoint>>? FiducialsMoved;
     private Point? measureStart;
     private Point? measureEnd;
     private bool hasData;
@@ -69,7 +73,8 @@ public sealed class PanelView : UserControl
 
         canvas.MouseWheel += ZoomPlan;
         canvas.MouseLeftButtonDown += BeginPlanGesture;
-        canvas.MouseLeftButtonUp += (_, _) => { dragStart = null; canvas.ReleaseMouseCapture(); };
+        canvas.MouseLeftButtonUp += EndPlanGesture;
+        canvas.LostMouseCapture += (_, _) => ClearPlanDrag();
         canvas.MouseMove += MovePlanGesture;
         measure.Unchecked += (_, _) => ClearMeasurement();
         thicknessField.LostKeyboardFocus += (_, _) => CommitThickness();
@@ -134,8 +139,7 @@ public sealed class PanelView : UserControl
 
     private static IReadOnlyList<CamBounds> LayoutFillAreas(CamBounds source, CamBounds boards, CamBounds panel, PanelOptions options)
     {
-        if (options.Routing is { } routing)
-            boards = CamEngine.Expand(boards, routing.RailChannel);
+        boards = CamEngine.RailLimit(boards, options);
         var areas = new List<CamBounds>
         {
             new(panel.MinX, panel.MinY, boards.MinX, panel.MaxY), new(boards.MaxX, panel.MinY, panel.MaxX, panel.MaxY),
@@ -173,6 +177,8 @@ public sealed class PanelView : UserControl
         board = nextBoard;
         layers = nextLayers;
         outline = nextOutline;
+        editableFiducials = [];
+        ClearPlanDrag();
         guideAreas = fills.Select(ToRect).ToArray();
         var materialOutline = new StreamGeometry { FillRule = FillRule.EvenOdd };
         using (var context = materialOutline.Open())
@@ -195,6 +201,12 @@ public sealed class PanelView : UserControl
             orbitZoom = 1;
         }
         InvalidateViews();
+    }
+
+    internal void SetEditableFiducials(IReadOnlyList<CamPoint> points)
+    {
+        editableFiducials = points;
+        canvas.InvalidateVisual();
     }
 
     public void SetVisibleRoles(IEnumerable<string> roles)
@@ -406,6 +418,16 @@ public sealed class PanelView : UserControl
             drawing.DrawGeometry(brush, new Pen(brush, 1.5 / PlanScale), shape);
         drawing.Pop();
 
+        if (visible.Contains("Copper,L1,Top"))
+            for (var index = 0; index < editableFiducials.Count; index++)
+            {
+                var point = index == draggedFiducial ? dragTarget ?? editableFiducials[index] : editableFiducials[index];
+                var screen = view.Transform(FromCam(point));
+                drawing.DrawEllipse(null, new Pen(FiducialColor, 1.6), screen, 6, 6);
+                if (index == draggedFiducial)
+                    DrawText(drawing, FormattableString.Invariant($"{point.X:0.#####}, {point.Y:0.#####} mm"), screen + new Vector(10, 9));
+            }
+
         DrawText(drawing, FormattableString.Invariant($"{board.Width:0.###} × {board.Height:0.###} mm"), new Point(12, Math.Max(2, canvas.ActualHeight - 25)));
         if (measureStart is { } start && measureEnd is { } end)
         {
@@ -497,14 +519,63 @@ public sealed class PanelView : UserControl
         }
         dragStart = cursor;
         dragOffset = pan;
+        draggedFiducial = FindFiducial(cursor);
+        dragTarget = draggedFiducial >= 0 ? editableFiducials[draggedFiducial] : null;
         canvas.CaptureMouse();
     }
 
     private void MovePlanGesture(object sender, MouseEventArgs e)
     {
+        var cursor = e.GetPosition(canvas);
         if (dragStart is not { } start || e.LeftButton != MouseButtonState.Pressed)
+        {
+            canvas.Cursor = measure.IsChecked != true && FindFiducial(cursor) >= 0 ? Cursors.SizeAll : Cursors.Arrow;
             return;
-        pan = dragOffset + (e.GetPosition(canvas) - start);
+        }
+        if (draggedFiducial >= 0)
+            dragTarget = SnapFiducial(editableFiducials[draggedFiducial], cursor - start, PlanScale);
+        else
+            pan = dragOffset + (cursor - start);
+        canvas.InvalidateVisual();
+    }
+
+    private int FindFiducial(Point cursor)
+    {
+        if (!hasData || !visible.Contains("Copper,L1,Top"))
+            return -1;
+        for (var index = 0; index < editableFiducials.Count; index++)
+            if ((cursor - (PlanCenter + (FromCam(editableFiducials[index]) - Center(board)) * PlanScale)).Length <= 9)
+                return index;
+        return -1;
+    }
+
+    internal static CamPoint SnapFiducial(CamPoint original, Vector delta, double scale) => new(
+        original.X + (decimal)Math.Round(delta.X / scale, MidpointRounding.AwayFromZero),
+        original.Y - (decimal)Math.Round(delta.Y / scale, MidpointRounding.AwayFromZero));
+
+    private void EndPlanGesture(object sender, MouseButtonEventArgs e)
+    {
+        CamPoint[]? moved = null;
+        if (draggedFiducial >= 0 && dragStart is { } start)
+        {
+            var target = SnapFiducial(editableFiducials[draggedFiducial], e.GetPosition(canvas) - start, PlanScale);
+            if (target != editableFiducials[draggedFiducial])
+            {
+                moved = editableFiducials.ToArray();
+                moved[draggedFiducial] = target;
+            }
+        }
+        ClearPlanDrag();
+        canvas.ReleaseMouseCapture();
+        if (moved is not null)
+            FiducialsMoved?.Invoke(moved);
+    }
+
+    private void ClearPlanDrag()
+    {
+        dragStart = null;
+        draggedFiducial = -1;
+        dragTarget = null;
         canvas.InvalidateVisual();
     }
 

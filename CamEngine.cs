@@ -29,14 +29,22 @@ public sealed record PanelOptions(int Rows, int Columns, decimal RailLeft, decim
     public decimal ColumnGap { get; init; }
     public decimal RowGap { get; init; }
     public bool FillGaps { get; init; }
+    public RoutingOptions? Routing { get; init; }
 
     internal bool HasGap => Columns > 1 && ColumnGap > 0 || Rows > 1 && RowGap > 0;
     internal decimal PitchX(CamBounds bounds) => bounds.Width + ColumnGap;
     internal decimal PitchY(CamBounds bounds) => bounds.Height + RowGap;
 }
 
+public sealed record RoutingOptions(decimal RailChannel, decimal CutterDiameter, decimal TabWidth,
+    int TabsPerEdge, decimal BiteDiameter, decimal BitePitch);
+
 public sealed record CamPanel(IReadOnlyList<CamFile> Files, CamBounds Bounds, IReadOnlyList<CamLine> Cuts,
-    IReadOnlyList<CamPoint> Fiducials, IReadOnlyList<CamPoint> Tooling, IReadOnlyList<string> Warnings);
+    IReadOnlyList<CamPoint> Fiducials, IReadOnlyList<CamPoint> Tooling, IReadOnlyList<string> Warnings)
+{
+    public int Tabs { get; init; }
+    public int MouseBites { get; init; }
+}
 
 public static class CamEngine
 {
@@ -128,7 +136,9 @@ public static class CamEngine
             throw Bad("패널 또는 보드의 외곽 Gerber가 필요합니다.");
         var isPanel = files.Any(file => !file.IsDrill && file.Text.Contains("%TF.Part,Array*%", StringComparison.Ordinal));
         var outline = Geometry(profiles[0]);
-        var bounds = isPanel ? RectangleBounds(outline) : PointBounds(OutlineContours(outline).SelectMany(path => path).ToArray());
+        if (isPanel && files.Any(file => file.Role == "Vcut") && RectangleProblem(outline) is { } problem)
+            throw Bad(problem);
+        var bounds = PointBounds(OutlineContours(outline).SelectMany(path => path).ToArray());
         ValidateStack(files);
         return new CamInput(Path.GetFullPath(path), files, bounds, isPanel);
     }
@@ -148,9 +158,9 @@ public static class CamEngine
     {
         var (boards, panel) = PlacementBounds(input, options);
         var source = input.Bounds;
-        if (VCutOutlineProblem(input) is { } problem)
+        if (options.Routing is null && VCutOutlineProblem(input) is { } problem)
             throw Bad(problem);
-        if (options.HasGap && !options.FillGaps)
+        if (options.Routing is null && options.HasGap && !options.FillGaps)
             throw Bad("빈 공간을 둔 배열의 제조 ZIP을 만들려면 탭 라우팅이 필요합니다.");
 
         if (options.Fiducials && (options.FiducialDiameter <= 0 || options.MaskDiameter <= options.FiducialDiameter))
@@ -164,7 +174,9 @@ public static class CamEngine
         if (input.Files.Any(file => file.Role.StartsWith("Profile,P", StringComparison.Ordinal)))
             throw Bad("도금된 외곽은 지원 대상에서 제외됩니다.");
 
-        var cuts = Cuts(source, panel, options);
+        var routed = options.Routing is { } routing
+            ? RoutedPanel.Build(input, options, routing, boards, panel) : null;
+        var cuts = routed is null ? Cuts(source, panel, options) : [];
         var hasLeftCut = options.Columns > 1 || options.RailLeft > 0;
         var hasRightCut = options.Columns > 1 || options.RailRight > 0;
         var hasBottomCut = options.Rows > 1 || options.RailBottom > 0;
@@ -183,7 +195,7 @@ public static class CamEngine
                 if (extent.MinX < source.MinX || extent.MinY < source.MinY ||
                     extent.MaxX > source.MaxX || extent.MaxY > source.MaxY)
                     throw Bad($"{file.Name}: 보드 외곽을 벗어나는 동박, 홀 또는 지움 형상이 있습니다.");
-                if (conductor && shape.Dark && ((hasLeftCut && extent.MinX - source.MinX < options.CutClearance) ||
+                if (routed is null && conductor && shape.Dark && ((hasLeftCut && extent.MinX - source.MinX < options.CutClearance) ||
                     (hasRightCut && source.MaxX - extent.MaxX < options.CutClearance) ||
                     (hasBottomCut && extent.MinY - source.MinY < options.CutClearance) ||
                     (hasTopCut && source.MaxY - extent.MaxY < options.CutClearance)))
@@ -191,39 +203,47 @@ public static class CamEngine
             }
         }
 
+        var railLimit = options.Routing is { } railRouting ? Expand(boards, railRouting.RailChannel) : boards;
+        var markCuts = routed is null ? cuts : Cuts(railLimit, panel, options with { Rows = 1, Columns = 1 });
         var marks = new List<(CamPoint Point, decimal Radius)>();
-        var fiducials = options.Fiducials ? Marks(panel, boards, cuts, options.CutClearance,
+        var fiducials = options.Fiducials ? Marks(panel, railLimit, markCuts, options.CutClearance,
             options.MaskDiameter / 2, options.FiducialPositions, marks) : [];
-        var tooling = options.Tooling ? Marks(panel, boards, cuts, options.CutClearance,
+        var tooling = options.Tooling ? Marks(panel, railLimit, markCuts, options.CutClearance,
             options.ToolingDiameter / 2, options.ToolingPositions, marks) : [];
+        var npthTools = new List<(decimal Diameter, IReadOnlyList<CamPoint> Points, bool Tooling)>();
+        if (tooling.Count > 0)
+            npthTools.Add((options.ToolingDiameter, tooling, true));
+        if (routed is not null)
+            npthTools.Add((options.Routing!.BiteDiameter, routed.Bites, false));
         var files = new List<CamFile>();
         foreach (var (file, geometry) in shapes)
         {
             var text = file.IsDrill
-                ? RepeatDrill(file, source, options, DrillKind(file.Role) == "NPTH" ? tooling : [])
+                ? RepeatDrill(file, source, options, DrillKind(file.Role) == "NPTH" ? npthTools : [])
                 : RepeatGerber(file, geometry.Count > 0, source, options, fiducials);
             files.Add(file with { Text = text });
         }
         var layerCount = files.Count(file => file.Role.StartsWith("Copper,", StringComparison.Ordinal));
-        if (tooling.Count > 0 && !files.Any(file => file.IsDrill && DrillKind(file.Role) == "NPTH"))
+        if (npthTools.Count > 0 && !files.Any(file => file.IsDrill && DrillKind(file.Role) == "NPTH"))
         {
             var role = $"NonPlated,1,{layerCount},NPTH";
             files.Add(new CamFile("panel-NPTH.drl", role, RepeatDrill(new("panel-NPTH.drl", role,
                 $"M48\n; #@! TF.FileFunction,{role}\nMETRIC\n%\nG90\nG05\nM30\n", true),
-                source, options, tooling), true));
+                source, options, npthTools), true));
         }
         var bottomLeft = new CamPoint(panel.MinX, panel.MinY);
         var bottomRight = new CamPoint(panel.MaxX, panel.MinY);
         var topRight = new CamPoint(panel.MaxX, panel.MaxY);
         var topLeft = new CamPoint(panel.MinX, panel.MaxY);
-        files.Add(LineFile("panel-Profile.gbr", "Profile,NP", [new(bottomLeft, bottomRight),
+        files.Add(LineFile("panel-Profile.gbr", "Profile,NP", routed?.Profile ?? [new(bottomLeft, bottomRight),
             new(bottomRight, topRight), new(topRight, topLeft), new(topLeft, bottomLeft)]));
         if (cuts.Count > 0)
             files.Add(LineFile("panel-Vcut.gbr", "Vcut", cuts));
         var warnings = input.Files.Any(file => file.IsDrill)
             ? Array.Empty<string>()
             : ["원본 드릴 파일이 없습니다. 단품에 가공 홀이 없는지 확인하세요."];
-        return new CamPanel(files, panel, cuts, fiducials, tooling, warnings);
+        return new CamPanel(files, panel, cuts, fiducials, tooling, warnings)
+        { Tabs = routed?.TabCount ?? 0, MouseBites = routed?.Bites.Count ?? 0 };
     }
 
     internal static (CamBounds Boards, CamBounds Panel) PlacementBounds(CamInput input, PanelOptions options)
@@ -241,14 +261,18 @@ public static class CamEngine
         var source = input.Bounds;
         var boards = source with { MaxX = source.MaxX + (options.Columns - 1) * options.PitchX(source),
             MaxY = source.MaxY + (options.Rows - 1) * options.PitchY(source) };
-        var panel = new CamBounds(boards.MinX - options.RailLeft, boards.MinY - options.RailBottom,
-            boards.MaxX + options.RailRight, boards.MaxY + options.RailTop);
+        var railLimit = Expand(boards, options.Routing?.RailChannel ?? 0);
+        var panel = new CamBounds(railLimit.MinX - options.RailLeft, railLimit.MinY - options.RailBottom,
+            railLimit.MaxX + options.RailRight, railLimit.MaxY + options.RailTop);
         if (panel.Width > 10000 || panel.Height > 10000)
             throw Bad("패널 치수가 지원 범위를 초과했습니다.");
         if (input.Files.Sum(file => (long)file.Text.Length) * copyCount > MaxGeneratedBytes)
             throw Bad("배열을 줄이세요. 생성할 패널 데이터가 지원 크기를 초과했습니다.");
         return (boards, panel);
     }
+
+    internal static CamBounds Expand(CamBounds bounds, decimal amount) =>
+        new(bounds.MinX - amount, bounds.MinY - amount, bounds.MaxX + amount, bounds.MaxY + amount);
 
     internal static string? VCutOutlineProblem(CamInput input) => RectangleProblem(
         Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal))));
@@ -308,13 +332,6 @@ public static class CamEngine
             if (fields[1] != "1" || fields[2] != copper.Length.ToString(Invariant))
                 throw Bad($"{file.Name}: 드릴 레이어 범위가 전체 동박층과 일치하지 않습니다.");
         }
-    }
-
-    private static CamBounds RectangleBounds(IReadOnlyList<CamShape> geometry)
-    {
-        if (RectangleProblem(geometry) is { } problem)
-            throw Bad(problem);
-        return PointBounds(geometry.SelectMany(shape => shape.Points).ToArray());
     }
 
     private static string? RectangleProblem(IReadOnlyList<CamShape> geometry)
@@ -851,7 +868,8 @@ public static class CamEngine
         return data.Hits.Select(hit => new CamShape("Drill", [hit.Point], data.Tools[hit.Id], data.Tools[hit.Id], true, true)).ToList();
     }
 
-    private static string RepeatDrill(CamFile file, CamBounds bounds, PanelOptions options, IReadOnlyList<CamPoint> marks)
+    private static string RepeatDrill(CamFile file, CamBounds bounds, PanelOptions options,
+        IReadOnlyList<(decimal Diameter, IReadOnlyList<CamPoint> Points, bool Tooling)> additions)
     {
         var data = ReadDrill(file.Text);
         var output = new StringBuilder();
@@ -866,10 +884,12 @@ public static class CamEngine
         output.Insert(output.ToString().IndexOf('\n') + 1,
             $"; #@! TF.GenerationSoftware,GerberHandler,GerberHandler{Environment.NewLine}; #@! TF.FileFunction,{file.Role}{Environment.NewLine}");
         var newTool = data.Tools.Keys.DefaultIfEmpty(0).Max() + 1;
-        if (marks.Count > 0)
+        for (var index = 0; index < additions.Count; index++)
         {
-            output.AppendLine("; #@! TA.AperFunction,NonPlated,NPTH,MechanicalDrill,Tooling");
-            output.AppendLine($"T{newTool}C{DrillNumber(options.ToolingDiameter)}");
+            var addition = additions[index];
+            output.AppendLine(addition.Tooling ? "; #@! TA.AperFunction,NonPlated,NPTH,MechanicalDrill,Tooling"
+                : "; #@! TA.AperFunction,NonPlated,NPTH,MechanicalDrill");
+            output.AppendLine($"T{newTool + index}C{DrillNumber(addition.Diameter)}");
         }
         output.AppendLine("%").AppendLine("G90").AppendLine("G05");
         foreach (var group in data.Hits.GroupBy(hit => hit.Id))
@@ -880,10 +900,10 @@ public static class CamEngine
                     foreach (var hit in group)
                         output.AppendLine(DrillPosition(new(hit.Point.X + column * options.PitchX(bounds), hit.Point.Y + row * options.PitchY(bounds))));
         }
-        if (marks.Count > 0)
+        for (var index = 0; index < additions.Count; index++)
         {
-            output.AppendLine($"T{newTool}");
-            foreach (var mark in marks)
+            output.AppendLine($"T{newTool + index}");
+            foreach (var mark in additions[index].Points)
                 output.AppendLine(DrillPosition(mark));
         }
         return output.AppendLine("M30").ToString();

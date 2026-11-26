@@ -10,7 +10,7 @@ internal sealed record Profile(string Name, string Source, DateOnly Date, decima
 {
     public IEnumerable<PanelFinding> Validate(CamPanel panel, PanelOptions options)
     {
-        if (options.HasGap && MinCutSpacing <= 0)
+        if (options.Routing is null && options.HasGap && MinCutSpacing <= 0)
             yield return new("빈 PCB 스트립을 제조하려면 프리셋에 최소 V-cut 간격을 입력하세요.", null);
         if (MinCutSpacing > 0)
         {
@@ -70,7 +70,7 @@ internal static class ProfileEditor
         var minHeight = AddField("최소 패널 세로 (mm)");
         var maxHeight = AddField("최대 패널 세로 (mm)");
         var rail = AddField("최소 레일 폭 (mm)");
-        var clearance = AddField("V-cut에서 동박·홀까지 최소 거리 (mm)");
+        var clearance = AddField("V-cut 동박·홀 여유 / 타공과 보드 사이 여유 (mm)");
         var cutSpacing = AddField("최소 V-cut 간격 (mm, 빈 PCB 스트립 제조 시 필요)");
         var fiducial = AddField("피두셜 동박 지름 (mm)");
         var mask = AddField("피두셜 마스크 개구 지름 (mm)");

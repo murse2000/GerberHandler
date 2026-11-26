@@ -134,12 +134,14 @@ public sealed class PanelView : UserControl
 
     private static IReadOnlyList<CamBounds> LayoutFillAreas(CamBounds source, CamBounds boards, CamBounds panel, PanelOptions options)
     {
+        if (options.Routing is { } routing)
+            boards = CamEngine.Expand(boards, routing.RailChannel);
         var areas = new List<CamBounds>
         {
             new(panel.MinX, panel.MinY, boards.MinX, panel.MaxY), new(boards.MaxX, panel.MinY, panel.MaxX, panel.MaxY),
             new(boards.MinX, panel.MinY, boards.MaxX, boards.MinY), new(boards.MinX, boards.MaxY, boards.MaxX, panel.MaxY)
         };
-        if (options.FillGaps)
+        if (options.FillGaps && options.Routing is null)
         {
             for (var row = 0; row < options.Rows; row++)
             {

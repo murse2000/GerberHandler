@@ -54,6 +54,10 @@
                         <Button Content="원본" Click="ShowSource" />
                         <Button Content="저장본" Click="ShowExport" />
                     </WrapPanel>
+                    <WrapPanel>
+                        <Button Content="전체 표시" Click="ShowAllLayers" Padding="7,3" />
+                        <Button Content="전체 숨기기" Click="HideAllLayers" Padding="7,3" />
+                    </WrapPanel>
                 </StackPanel>
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel x:Name="LayerList" Margin="10,0,8,10" />
@@ -76,8 +80,27 @@
                         <StackPanel Margin="0,0,8,0"><TextBlock Text="아래 레일 (mm)" /><TextBox x:Name="RailBottom" Text="5" /></StackPanel>
                         <StackPanel><TextBlock Text="위 레일 (mm)" /><TextBox x:Name="RailTop" Text="5" /></StackPanel>
                     </UniformGrid>
-                    <CheckBox x:Name="FillGaps" Content="간격을 빈 PCB로 채우기" Margin="0,0,0,5" />
+                    <CheckBox x:Name="FillGaps" Content="간격을 빈 PCB로 채우기" Margin="0,0,0,5">
+                        <CheckBox.Style>
+                            <Style TargetType="CheckBox">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsChecked, ElementName=TabRouting}" Value="True">
+                                        <Setter Property="IsEnabled" Value="False" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </CheckBox.Style>
+                    </CheckBox>
                     <TextBlock Text="커넥터 등 부품이 돌출되면 필요한 간격을 입력하세요." TextWrapping="Wrap" Margin="0,0,0,5" />
+                    <CheckBox x:Name="TabRouting" Content="탭 라우팅 + 마우스바이트" Margin="0,2,0,5" />
+                    <UniformGrid Columns="2" Margin="0,0,0,6" IsEnabled="{Binding IsChecked, ElementName=TabRouting}">
+                        <StackPanel Margin="0,0,8,0"><TextBlock Text="보드–레일 간격 (mm)" /><TextBox x:Name="RailChannel" Text="3" /></StackPanel>
+                        <StackPanel><TextBlock Text="라우터 지름 (mm)" /><TextBox x:Name="CutterDiameter" Text="2" /></StackPanel>
+                        <StackPanel Margin="0,0,8,0"><TextBlock Text="탭 폭 (mm)" /><TextBox x:Name="TabWidth" Text="5" /></StackPanel>
+                        <StackPanel><TextBlock Text="변당 탭 수" /><TextBox x:Name="TabsPerEdge" Text="2" /></StackPanel>
+                        <StackPanel Margin="0,0,8,0"><TextBlock Text="타공 지름 (mm)" /><TextBox x:Name="BiteDiameter" Text="0.5" /></StackPanel>
+                        <StackPanel><TextBlock Text="타공 피치 (mm)" /><TextBox x:Name="BitePitch" Text="0.9" /></StackPanel>
+                    </UniformGrid>
                     <Separator />
                     <TextBlock Text="조립용 마크" FontWeight="Bold" FontSize="16" />
                     <CheckBox x:Name="Fiducials" Content="상면 피두셜" IsChecked="True" Margin="0,8,0,3" />

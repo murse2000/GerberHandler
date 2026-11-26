@@ -285,8 +285,8 @@ public partial class MainWindow : Window
     {
         var project = Snapshot();
         var input = RequireSource();
-        var problem = CamEngine.VCutOutlineProblem(input);
-        if (problem is not null || project.Options.HasGap && !project.Options.FillGaps)
+        var problem = project.Options.Routing is null ? CamEngine.VCutOutlineProblem(input) : null;
+        if (project.Options.Routing is null && (problem is not null || project.Options.HasGap && !project.Options.FillGaps))
         {
             var (boards, layoutBounds) = CamEngine.PlacementBounds(input, project.Options);
             IReadOnlyList<CamPoint> fiducials = [];
@@ -307,6 +307,7 @@ public partial class MainWindow : Window
         SetChecks(panel, project.Profile, false);
         var marks = string.Join(" / ", panel.Fiducials.Select(p => $"({Number(p.X)}, {Number(p.Y)})"));
         StatusLabel.Text = $"{project.Options.Rows * project.Options.Columns}장 · {Size(panel.Bounds)}" +
+            (panel.Tabs == 0 ? "" : $" · 연결 탭 {panel.Tabs}개 · 마우스바이트 {panel.MouseBites}개") +
             (marks.Length == 0 ? "" : $" · 피두셜 {marks}");
     }
 
@@ -430,11 +431,12 @@ public partial class MainWindow : Window
                 System.Windows.Automation.AutomationProperties.SetName(toggle, (string)toggle.ToolTip);
             }
             RefreshIcon();
+            toggle.Checked += (_, _) => RefreshIcon();
+            toggle.Unchecked += (_, _) => RefreshIcon();
             toggle.Click += (_, _) =>
             {
                 if (toggle.IsChecked == true) hiddenLayers.Remove(role);
                 else hiddenLayers.Add(role);
-                RefreshIcon();
                 UpdateLayers();
             };
             var row = new DockPanel { Tag = role };
@@ -453,6 +455,22 @@ public partial class MainWindow : Window
 
     private void UpdateLayers() => Viewer.SetVisibleRoles(
         LayerList.Children.OfType<DockPanel>().Select(row => (string)row.Tag).Where(role => !hiddenLayers.Contains(role)));
+
+    private void ShowAllLayers(object sender, RoutedEventArgs e) => SetAllLayers(true);
+
+    private void HideAllLayers(object sender, RoutedEventArgs e) => SetAllLayers(false);
+
+    private void SetAllLayers(bool showing)
+    {
+        foreach (var row in LayerList.Children.OfType<DockPanel>())
+        {
+            var role = (string)row.Tag;
+            if (showing) hiddenLayers.Remove(role);
+            else hiddenLayers.Add(role);
+            ((ToggleButton)row.Children[0]).IsChecked = showing;
+        }
+        UpdateLayers();
+    }
 
     private void EditLayerColors(object sender, RoutedEventArgs e) => Run(() =>
     {
@@ -523,7 +541,7 @@ public partial class MainWindow : Window
         if (Presets.SelectedItem is Profile profile)
         {
             PresetLabel.Text = $"{profile.Source} · {Number(profile.MinWidth)}–{Number(profile.MaxWidth)} × " +
-                $"{Number(profile.MinHeight)}–{Number(profile.MaxHeight)} mm · V-cut 여유 {Number(profile.Clearance)} mm";
+                $"{Number(profile.MinHeight)}–{Number(profile.MaxHeight)} mm · 가공 여유 {Number(profile.Clearance)} mm";
             FiducialDiameter.Text = Number(profile.FiducialDiameter);
             MaskDiameter.Text = Number(profile.MaskDiameter);
             ToolingDiameter.Text = Number(profile.ToolingDiameter);
@@ -566,7 +584,9 @@ public partial class MainWindow : Window
         ToolingPositions = ParsePositions(ToolingPositions.Text),
         RowGap = ReadNumber(RowGap.Text),
         ColumnGap = ReadNumber(ColumnGap.Text),
-        FillGaps = FillGaps.IsChecked == true
+        FillGaps = TabRouting.IsChecked != true && FillGaps.IsChecked == true,
+        Routing = TabRouting.IsChecked == true ? new RoutingOptions(ReadNumber(RailChannel.Text), ReadNumber(CutterDiameter.Text),
+            ReadNumber(TabWidth.Text), PositiveInteger(TabsPerEdge), ReadNumber(BiteDiameter.Text), ReadNumber(BitePitch.Text)) : null
     };
 
     private void ApplyOptions(PanelOptions options)
@@ -576,6 +596,16 @@ public partial class MainWindow : Window
         RowGap.Text = Number(options.RowGap);
         ColumnGap.Text = Number(options.ColumnGap);
         FillGaps.IsChecked = options.FillGaps;
+        TabRouting.IsChecked = options.Routing is not null;
+        if (options.Routing is { } routing)
+        {
+            RailChannel.Text = Number(routing.RailChannel);
+            CutterDiameter.Text = Number(routing.CutterDiameter);
+            TabWidth.Text = Number(routing.TabWidth);
+            TabsPerEdge.Text = Number(routing.TabsPerEdge);
+            BiteDiameter.Text = Number(routing.BiteDiameter);
+            BitePitch.Text = Number(routing.BitePitch);
+        }
         RailLeft.Text = Number(options.RailLeft);
         RailRight.Text = Number(options.RailRight);
         RailBottom.Text = Number(options.RailBottom);

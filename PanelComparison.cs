@@ -55,7 +55,7 @@ internal static class PanelComparison
             findings.Add(new("계획된 변경 · 레일 피두셜", point.Points[0]));
         foreach (var shape in output.Files.Where(file => file.IsDrill && file.Role.StartsWith("NonPlated,", StringComparison.Ordinal))
                      .SelectMany(CamEngine.Geometry).Where(shape => !InBoardArea(shape.Points[0])))
-            findings.Add(new("레일 비도금 홀 · 위치 확인", shape.Points[0]));
+            findings.Add(new("배열 외곽의 비도금 홀 · 위치 확인", shape.Points[0]));
 
         return new(missing, added, findings);
 

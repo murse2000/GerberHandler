@@ -272,7 +272,17 @@ public partial class MainWindow : Window
     private void Preview()
     {
         var project = Snapshot();
-        var panel = CamEngine.Build(RequireSource(), project.Options);
+        var input = RequireSource();
+        if (CamEngine.VCutOutlineProblem(input) is { } problem)
+        {
+            var (boards, layoutBounds) = CamEngine.PlacementBounds(input, project.Options);
+            Viewer.SetLayout(input, project.Options, boards, layoutBounds);
+            ShowLayers("배열 미리보기", input.Files, layoutBounds);
+            StatusLabel.Text = $"{project.Options.Rows * project.Options.Columns}장 · {Size(layoutBounds)} · {problem} 레일 마크와 절단선은 제조용 패널에서 표시됩니다.";
+            return;
+        }
+
+        var panel = CamEngine.Build(input, project.Options);
         ShowFiles("편집 중인 패널", panel.Files, panel.Bounds);
         SetChecks(panel, project.Profile, false);
         var marks = string.Join(" / ", panel.Fiducials.Select(p => $"({Number(p.X)}, {Number(p.Y)})"));
@@ -360,6 +370,11 @@ public partial class MainWindow : Window
     private void ShowFiles(string title, IReadOnlyList<CamFile> files, CamBounds bounds)
     {
         Viewer.SetData(files, bounds);
+        ShowLayers(title, files, bounds);
+    }
+
+    private void ShowLayers(string title, IReadOnlyList<CamFile> files, CamBounds bounds)
+    {
         LayerList.Children.Clear();
         foreach (var group in files.GroupBy(file => file.Role))
         {

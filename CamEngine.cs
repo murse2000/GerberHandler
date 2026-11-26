@@ -139,13 +139,11 @@ public static class CamEngine
 
     public static CamPanel Build(CamInput input, PanelOptions options)
     {
-        if (input.IsPanel)
-            throw Bad("단일 보드 Gerber·드릴 세트를 지정하세요.");
-        if (options.Rows < 1 || options.Columns < 1 || (long)options.Rows * options.Columns > MaxCopies)
-            throw Bad($"배열은 1개부터 {MaxCopies}개까지 지원합니다.");
-        if (new[] { options.RailLeft, options.RailRight, options.RailBottom, options.RailTop, options.CutClearance }
-            .Any(value => value is < 0 or > 10000))
-            throw Bad("레일 폭과 절단 이격은 0~10000 mm 범위여야 합니다.");
+        var (boards, panel) = PlacementBounds(input, options);
+        var source = input.Bounds;
+        if (VCutOutlineProblem(input) is { } problem)
+            throw Bad(problem);
+
         if (options.Fiducials && (options.FiducialDiameter <= 0 || options.MaskDiameter <= options.FiducialDiameter))
             throw Bad("피두셜 동박 지름과 그보다 큰 마스크 개구 지름을 지정하세요.");
         if (options.Fiducials && !input.Files.Any(file => file.Role == "Soldermask,Top"))
@@ -156,20 +154,6 @@ public static class CamEngine
             throw Bad("이미 V-cut 레이어를 가진 제조 세트입니다.");
         if (input.Files.Any(file => file.Role.StartsWith("Profile,P", StringComparison.Ordinal)))
             throw Bad("도금된 외곽은 지원 대상에서 제외됩니다.");
-
-        var source = RectangleBounds(Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal))));
-        var boards = source with
-        {
-            MaxX = source.MinX + options.Columns * source.Width,
-            MaxY = source.MinY + options.Rows * source.Height
-        };
-        var panel = new CamBounds(boards.MinX - options.RailLeft, boards.MinY - options.RailBottom,
-            boards.MaxX + options.RailRight, boards.MaxY + options.RailTop);
-        if (panel.Width > 10000 || panel.Height > 10000)
-            throw Bad("패널 치수가 지원 범위를 초과했습니다.");
-        var copyCount = options.Rows * options.Columns;
-        if (input.Files.Sum(file => (long)file.Text.Length) * copyCount > MaxGeneratedBytes)
-            throw Bad("배열을 줄이세요. 생성할 제조 파일의 크기가 지원 범위를 초과했습니다.");
 
         var cuts = Cuts(source, boards, panel, options);
         var hasLeftCut = options.Columns > 1 || options.RailLeft > 0;
@@ -233,6 +217,30 @@ public static class CamEngine
         return new CamPanel(files, panel, cuts, fiducials, tooling, warnings);
     }
 
+    internal static (CamBounds Boards, CamBounds Panel) PlacementBounds(CamInput input, PanelOptions options)
+    {
+        if (input.IsPanel)
+            throw Bad("단일 보드 Gerber·드릴 세트를 지정하세요.");
+        var copyCount = (long)options.Rows * options.Columns;
+        if (options.Rows < 1 || options.Columns < 1 || copyCount > MaxCopies)
+            throw Bad($"배열은 1개부터 {MaxCopies}개까지 지원합니다.");
+        if (new[] { options.RailLeft, options.RailRight, options.RailBottom, options.RailTop, options.CutClearance }
+            .Any(value => value is < 0 or > 10000))
+            throw Bad("레일 폭과 절단 이격은 0~10000 mm 범위여야 합니다.");
+        var source = input.Bounds;
+        var boards = source with { MaxX = source.MinX + options.Columns * source.Width, MaxY = source.MinY + options.Rows * source.Height };
+        var panel = new CamBounds(boards.MinX - options.RailLeft, boards.MinY - options.RailBottom,
+            boards.MaxX + options.RailRight, boards.MaxY + options.RailTop);
+        if (panel.Width > 10000 || panel.Height > 10000)
+            throw Bad("패널 치수가 지원 범위를 초과했습니다.");
+        if (input.Files.Sum(file => (long)file.Text.Length) * copyCount > MaxGeneratedBytes)
+            throw Bad("배열을 줄이세요. 생성할 패널 데이터가 지원 크기를 초과했습니다.");
+        return (boards, panel);
+    }
+
+    internal static string? VCutOutlineProblem(CamInput input) => RectangleProblem(
+        Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal))));
+
     public static void Export(CamPanel panel, string path)
     {
         path = Path.GetFullPath(path);
@@ -280,8 +288,15 @@ public static class CamEngine
 
     private static CamBounds RectangleBounds(IReadOnlyList<CamShape> geometry)
     {
+        if (RectangleProblem(geometry) is { } problem)
+            throw Bad(problem);
+        return PointBounds(geometry.SelectMany(shape => shape.Points).ToArray());
+    }
+
+    private static string? RectangleProblem(IReadOnlyList<CamShape> geometry)
+    {
         if (geometry.Count != 4 || geometry.Any(shape => shape.Kind != "Line" || !shape.Dark))
-            throw Bad("V-cut 패널 생성에는 네 개의 직선으로 닫힌 직사각형 외곽이 필요합니다.");
+            return "V-cut 제조 ZIP 저장에는 직사각형 외곽이 필요합니다.";
         var points = geometry.SelectMany(shape => shape.Points).ToArray();
         var bounds = PointBounds(points);
         var corners = new HashSet<CamPoint> { new(bounds.MinX, bounds.MinY), new(bounds.MinX, bounds.MaxY),
@@ -289,13 +304,11 @@ public static class CamEngine
         if (bounds.Width <= 0 || bounds.Height <= 0 || points.GroupBy(point => point).Any(group => group.Count() != 2)
             || !corners.SetEquals(points)
             || geometry.Any(shape => (shape.Points[0].X == shape.Points[1].X) == (shape.Points[0].Y == shape.Points[1].Y)))
-            throw Bad("외곽선이 축에 평행한 직사각형을 이루지 않습니다.");
+            return "외곽선이 축에 평행한 직사각형을 이루지 않습니다.";
         var edges = geometry.Select(shape =>
             (shape.Points[0].X == shape.Points[1].X, Math.Min(shape.Points[0].X, shape.Points[1].X),
                 Math.Min(shape.Points[0].Y, shape.Points[1].Y))).Distinct().Count();
-        if (edges != 4)
-            throw Bad("외곽선에 중복 선이 있습니다.");
-        return bounds;
+        return edges == 4 ? null : "외곽선에 중복 선이 있습니다.";
     }
 
     internal static IReadOnlyList<IReadOnlyList<CamPoint>> OutlineContours(IReadOnlyList<CamShape> outline)

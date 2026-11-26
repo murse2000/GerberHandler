@@ -83,14 +83,59 @@ public sealed class PanelView : UserControl
 
     public void SetData(IReadOnlyList<CamFile> files, CamBounds bounds)
     {
-        var nextBoard = new Rect((double)bounds.MinX, -(double)bounds.MaxY, (double)bounds.Width, (double)bounds.Height);
-        var nextLayers = files.Select(file => BuildLayer(file, nextBoard)).ToArray();
+        var nextBoard = ToRect(bounds);
+        var nextLayers = files.Select(file => BuildLayer(file, CamEngine.Geometry(file), nextBoard)).ToArray();
         var nextOutline = CamEngine.OutlineContours(nextLayers.Single(layer => layer.Role.StartsWith("Profile", StringComparison.Ordinal)).Shapes);
+        ApplyData(nextBoard, nextLayers, nextOutline);
+    }
+
+    internal void SetLayout(CamInput input, PanelOptions options, CamBounds boards, CamBounds panel)
+    {
+        var nextBoard = ToRect(panel);
+        var offsets = Enumerable.Range(0, options.Rows).SelectMany(row => Enumerable.Range(0, options.Columns)
+            .Select(column => new CamPoint(column * input.Bounds.Width, row * input.Bounds.Height))).ToArray();
+        var railContours = new[]
+        {
+            new CamBounds(panel.MinX, panel.MinY, boards.MinX, panel.MaxY),
+            new CamBounds(boards.MaxX, panel.MinY, panel.MaxX, panel.MaxY),
+            new CamBounds(boards.MinX, panel.MinY, boards.MaxX, boards.MinY),
+            new CamBounds(boards.MinX, boards.MaxY, boards.MaxX, panel.MaxY)
+        }.Where(rail => rail.Width > 0 && rail.Height > 0).Select(RectangleContour).ToArray();
+        var nextLayers = new List<Layer>();
+        var nextOutline = new List<IReadOnlyList<CamPoint>>();
+        foreach (var file in input.Files)
+        {
+            var shapes = CamEngine.Geometry(file);
+            var translated = offsets.SelectMany(offset => shapes.Select(shape => CamEngine.Translate(shape, offset.X, offset.Y))).ToList();
+            if (file.Role.StartsWith("Profile", StringComparison.Ordinal))
+            {
+                // 보드 외곽이 서로 접해도 각 원본 경계는 독립된 폐곡선으로 유지한다.
+                var contours = CamEngine.OutlineContours(shapes);
+                nextOutline.AddRange(offsets.SelectMany(offset => contours.Select(contour => (IReadOnlyList<CamPoint>)contour
+                    .Select(point => new CamPoint(point.X + offset.X, point.Y + offset.Y)).ToArray())));
+                nextOutline.AddRange(railContours);
+                translated.AddRange(railContours.SelectMany(contour => contour.Zip(contour.Skip(1),
+                    (from, to) => new CamShape("Line", [from, to], .1m, .1m, true, true))));
+            }
+            nextLayers.Add(BuildLayer(file, translated, nextBoard));
+        }
+        ApplyData(nextBoard, nextLayers, nextOutline);
+    }
+
+    private static Rect ToRect(CamBounds bounds) => new((double)bounds.MinX, -(double)bounds.MaxY,
+        (double)bounds.Width, (double)bounds.Height);
+
+    private static IReadOnlyList<CamPoint> RectangleContour(CamBounds bounds) =>
+        [new(bounds.MinX, bounds.MinY), new(bounds.MaxX, bounds.MinY), new(bounds.MaxX, bounds.MaxY),
+            new(bounds.MinX, bounds.MaxY), new(bounds.MinX, bounds.MinY)];
+
+    private void ApplyData(Rect nextBoard, IReadOnlyList<Layer> nextLayers, IReadOnlyList<IReadOnlyList<CamPoint>> nextOutline)
+    {
         var sameBoard = hasData && board == nextBoard;
         board = nextBoard;
         layers = nextLayers;
         outline = nextOutline;
-        visible = files.Select(file => file.Role).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        visible = nextLayers.Select(layer => layer.Role).ToHashSet(StringComparer.OrdinalIgnoreCase);
         differences = [];
         hasData = board.Width > 0 && board.Height > 0;
         measureStart = null;
@@ -160,9 +205,8 @@ public sealed class PanelView : UserControl
         return button;
     }
 
-    private static Layer BuildLayer(CamFile file, Rect extent)
+    private static Layer BuildLayer(CamFile file, IReadOnlyList<CamShape> shapes, Rect extent)
     {
-        var shapes = CamEngine.Geometry(file);
         var elements = shapes.Select(shape => (Shape: shape, Geometry: ShapeGeometry(shape))).ToArray();
         var color = file.Role.Split(',')[0] switch
         {

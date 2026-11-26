@@ -49,6 +49,18 @@ public sealed class PanelView : UserControl
     private int draggedBoard = -1;
     internal event Action<int>? BoardSelected;
     internal event Action<int, CamPoint>? BoardMoved;
+    private readonly System.Windows.Controls.Primitives.ToggleButton addTab = new()
+    {
+        Content = "탭 추가", Margin = new Thickness(3, 0, 3, 0), ToolTip = "보드 사이 또는 보드와 레일 사이의 빈 공간을 클릭하세요."
+    };
+    private readonly Button deleteTab;
+    private readonly Button resetTabs;
+    private IReadOnlyList<MixedTab> editableTabs = [];
+    private decimal tabHalfWidth;
+    private int selectedTab = -1;
+    private int draggedTab = -1;
+    private MixedTab? tabTarget;
+    internal event Action<IReadOnlyList<MixedTab>?, CamPoint?>? TabsEdited;
     private Point? measureStart;
     private Point? measureEnd;
     private bool hasData;
@@ -61,7 +73,10 @@ public sealed class PanelView : UserControl
     public PanelView()
     {
         canvas = new CanvasSurface(DrawPlan) { ClipToBounds = true };
-        var planPage = CreatePage(canvas, Button("전체 보기", FitPlan), measure, measuringResult);
+        deleteTab = Button("탭 삭제", () => TabsEdited?.Invoke(editableTabs.Where((_, index) => index != selectedTab).ToArray(), null));
+        resetTabs = Button("자동 탭 복원", () => TabsEdited?.Invoke(null, null));
+        SetEditableTabs(null, 0, false);
+        var planPage = CreatePage(canvas, Button("전체 보기", FitPlan), measure, addTab, deleteTab, resetTabs, measuringResult);
         viewport.ClipToBounds = true;
         viewport.Camera = camera;
         viewport.Children.Add(scene);
@@ -82,6 +97,8 @@ public sealed class PanelView : UserControl
         canvas.LostMouseCapture += (_, _) => ClearPlanDrag();
         canvas.MouseMove += MovePlanGesture;
         measure.Unchecked += (_, _) => ClearMeasurement();
+        measure.Checked += (_, _) => addTab.IsChecked = false;
+        addTab.Checked += (_, _) => measure.IsChecked = false;
         thicknessField.LostKeyboardFocus += (_, _) => CommitThickness();
         thicknessField.KeyDown += (_, e) => { if (e.Key == Key.Enter) CommitThickness(); };
         viewport.MouseLeftButtonDown += (_, e) => { dragStart = e.GetPosition(viewport); viewport.CaptureMouse(); };
@@ -235,6 +252,7 @@ public sealed class PanelView : UserControl
         editableFiducials = [];
         editableBoards = [];
         selectedBoard = -1;
+        SetEditableTabs(null, 0, false);
         ClearPlanDrag();
         guideAreas = fills.Select(ToRect).ToArray();
         var materialOutline = new StreamGeometry { FillRule = FillRule.EvenOdd };
@@ -263,6 +281,18 @@ public sealed class PanelView : UserControl
     internal void SetEditableFiducials(IReadOnlyList<CamPoint> points)
     {
         editableFiducials = points;
+        canvas.InvalidateVisual();
+    }
+
+    internal void SetEditableTabs(IReadOnlyList<MixedTab>? positions, decimal width, bool manual)
+    {
+        editableTabs = positions ?? [];
+        tabHalfWidth = width / 2;
+        selectedTab = -1;
+        addTab.IsChecked = false;
+        addTab.Visibility = deleteTab.Visibility = positions is null ? Visibility.Collapsed : Visibility.Visible;
+        deleteTab.IsEnabled = false;
+        resetTabs.Visibility = manual ? Visibility.Visible : Visibility.Collapsed;
         canvas.InvalidateVisual();
     }
 
@@ -487,6 +517,13 @@ public sealed class PanelView : UserControl
             drawing.DrawGeometry(brush, new Pen(brush, 1.5 / PlanScale), shape);
         drawing.Pop();
 
+        for (var index = 0; index < editableTabs.Count; index++)
+        {
+            var tab = index == draggedTab ? tabTarget ?? editableTabs[index] : editableTabs[index];
+            var stroke = new Pen(index == selectedTab ? Brushes.White : CutColor, index == selectedTab ? 2 : 1);
+            drawing.DrawRectangle(null, stroke, Rect.Transform(ToRect(tab.Bounds(tabHalfWidth)), view));
+        }
+
         if (selectedBoard >= 0 && selectedBoard < editableBoards.Count)
         {
             var selected = editableBoards[selectedBoard];
@@ -594,16 +631,26 @@ public sealed class PanelView : UserControl
             canvas.InvalidateVisual();
             return;
         }
+        if (addTab.IsChecked == true)
+        {
+            var point = Center(board) + (cursor - PlanCenter) / PlanScale;
+            addTab.IsChecked = false;
+            TabsEdited?.Invoke(editableTabs, new CamPoint(decimal.Round((decimal)point.X, 6), decimal.Round(-(decimal)point.Y, 6)));
+            return;
+        }
         dragStart = cursor;
         dragOffset = pan;
-        draggedFiducial = FindFiducial(cursor);
+        selectedTab = draggedTab = FindTab(cursor);
+        deleteTab.IsEnabled = selectedTab >= 0;
+        draggedFiducial = draggedTab < 0 ? FindFiducial(cursor) : -1;
         dragTarget = draggedFiducial >= 0 ? editableFiducials[draggedFiducial] : null;
-        if (draggedFiducial < 0 && editableBoards.Count > 0)
+        if (draggedTab < 0 && draggedFiducial < 0 && editableBoards.Count > 0)
         {
             draggedBoard = FindBoard(cursor);
             BoardSelected?.Invoke(draggedBoard);
         }
         canvas.CaptureMouse();
+        canvas.InvalidateVisual();
     }
 
     private void MovePlanGesture(object sender, MouseEventArgs e)
@@ -611,10 +658,13 @@ public sealed class PanelView : UserControl
         var cursor = e.GetPosition(canvas);
         if (dragStart is not { } start || e.LeftButton != MouseButtonState.Pressed)
         {
-            canvas.Cursor = measure.IsChecked != true && (FindFiducial(cursor) >= 0 || FindBoard(cursor) >= 0) ? Cursors.SizeAll : Cursors.Arrow;
+            canvas.Cursor = addTab.IsChecked == true ? Cursors.Cross : measure.IsChecked != true &&
+                (FindTab(cursor) >= 0 || FindFiducial(cursor) >= 0 || FindBoard(cursor) >= 0) ? Cursors.SizeAll : Cursors.Arrow;
             return;
         }
-        if (draggedFiducial >= 0)
+        if (draggedTab >= 0)
+            tabTarget = MoveTab(editableTabs[draggedTab], cursor - start, PlanScale);
+        else if (draggedFiducial >= 0)
             dragTarget = SnapFiducial(editableFiducials[draggedFiducial], cursor - start, PlanScale);
         else if (draggedBoard >= 0)
             dragTarget = SnapBoard(editableBoards[draggedBoard].Origin, cursor - start, PlanScale);
@@ -622,6 +672,24 @@ public sealed class PanelView : UserControl
             pan = dragOffset + (cursor - start);
         canvas.InvalidateVisual();
     }
+
+    private int FindTab(Point cursor)
+    {
+        var position = Center(board) + (cursor - PlanCenter) / PlanScale;
+        for (var index = 0; index < editableTabs.Count; index++)
+        {
+            var hit = ToRect(editableTabs[index].Bounds(tabHalfWidth));
+            hit.Inflate(3 / PlanScale, 3 / PlanScale);
+            if (hit.Contains(position))
+                return index;
+        }
+        return -1;
+    }
+
+    internal static MixedTab MoveTab(MixedTab tab, Vector delta, double scale) => tab with
+    {
+        Center = tab.Center + (decimal)Math.Round((tab.Vertical ? -delta.Y : delta.X) / scale, 1, MidpointRounding.AwayFromZero)
+    };
 
     private int FindFiducial(Point cursor)
     {
@@ -655,9 +723,20 @@ public sealed class PanelView : UserControl
     private void EndPlanGesture(object sender, MouseButtonEventArgs e)
     {
         CamPoint[]? moved = null;
+        MixedTab[]? movedTabs = null;
         var boardIndex = draggedBoard;
         CamPoint? boardTarget = null;
-        if (draggedFiducial >= 0 && dragStart is { } start)
+        if (draggedTab >= 0 && dragStart is { } tabStart)
+        {
+            var original = editableTabs[draggedTab];
+            var target = MoveTab(original, e.GetPosition(canvas) - tabStart, PlanScale);
+            if (target != original)
+            {
+                movedTabs = editableTabs.ToArray();
+                movedTabs[draggedTab] = target;
+            }
+        }
+        else if (draggedFiducial >= 0 && dragStart is { } start)
         {
             var target = SnapFiducial(editableFiducials[draggedFiducial], e.GetPosition(canvas) - start, PlanScale);
             if (target != editableFiducials[draggedFiducial])
@@ -675,6 +754,8 @@ public sealed class PanelView : UserControl
         }
         ClearPlanDrag();
         canvas.ReleaseMouseCapture();
+        if (movedTabs is not null)
+            TabsEdited?.Invoke(movedTabs, null);
         if (moved is not null)
             FiducialsMoved?.Invoke(moved);
         if (boardTarget is { } next)
@@ -686,6 +767,8 @@ public sealed class PanelView : UserControl
         dragStart = null;
         draggedFiducial = -1;
         draggedBoard = -1;
+        draggedTab = -1;
+        tabTarget = null;
         dragTarget = null;
         canvas.InvalidateVisual();
     }

@@ -3,6 +3,13 @@ using Clipper2Lib;
 
 namespace GerberHandler;
 
+internal sealed record MixedTab(bool Vertical, decimal Start, decimal End, decimal Center)
+{
+    internal CamBounds Bounds(decimal half) => Vertical
+        ? new(Start, Center - half, End, Center + half)
+        : new(Center - half, Start, Center + half, End);
+}
+
 internal static class MixedRouting
 {
     private readonly record struct Interval(decimal Start, decimal End);
@@ -10,7 +17,7 @@ internal static class MixedRouting
     private sealed record Bridge(int First, int Second, bool Vertical, decimal Start, decimal End, Interval[] Span);
 
     internal static RoutedPanel Build(IReadOnlyList<MixedBoard> boards, PanelOptions options, RoutingOptions routing,
-        CamBounds boardBounds, CamBounds panelBounds)
+        CamBounds boardBounds, CamBounds panelBounds, CamPoint? addition = null)
     {
         var radius = routing.BiteDiameter / 2;
         var offset = radius + options.CutClearance;
@@ -84,8 +91,55 @@ internal static class MixedRouting
             }
 
         var tabAreas = new List<CamBounds>();
+        var tabs = new List<MixedTab>();
         var bites = new List<CamPoint>();
-        foreach (var bridge in candidates.OrderBy(item => item.End - item.Start))
+        var half = routing.TabWidth / 2;
+        var reserve = half + routing.CutterDiameter;
+        if (options.MixedTabs is { } manual)
+        {
+            foreach (var tab in manual)
+            {
+                var bridge = candidates.FirstOrDefault(candidate => candidate.Vertical == tab.Vertical &&
+                    candidate.Start == tab.Start && candidate.End == tab.End && Fits(candidate, tab.Center));
+                if (bridge is null)
+                    throw new InvalidDataException("이 위치에 탭을 놓을 수 없습니다. 마주 보는 직선 외곽과 공구 여유를 확인하세요.");
+                AddTab(bridge, tab.Center);
+            }
+        }
+        else
+        {
+            foreach (var bridge in candidates.OrderBy(item => item.End - item.Start))
+            {
+                var run = Available(bridge).Where(span => span.End - span.Start >= 2 * reserve +
+                        (routing.TabsPerEdge - 1) * (routing.TabWidth + routing.CutterDiameter))
+                    .OrderByDescending(span => span.End - span.Start).FirstOrDefault();
+                if (run.End <= run.Start)
+                    continue;
+                for (var index = 0; index < routing.TabsPerEdge; index++)
+                    AddTab(bridge, routing.TabsPerEdge == 1 ? (run.Start + run.End) / 2 : run.Start + reserve +
+                        index * (run.End - run.Start - 2 * reserve) / (routing.TabsPerEdge - 1));
+            }
+        }
+
+        if (addition is { } point)
+        {
+            var bridge = candidates.OrderBy(item => item.End - item.Start).FirstOrDefault(candidate =>
+            {
+                var axis = candidate.Vertical ? point.X : point.Y;
+                return axis >= candidate.Start && axis <= candidate.End &&
+                    Fits(candidate, candidate.Vertical ? point.Y : point.X);
+            }) ?? throw new InvalidDataException("탭을 추가할 수 있는 보드 사이 또는 보드와 레일 사이의 빈 공간을 클릭하세요.");
+            AddTab(bridge, bridge.Vertical ? point.Y : point.X);
+        }
+
+        if (Clipper.Union(material, FillRule.NonZero).Count(Clipper.IsPositive) != 1)
+            throw new InvalidDataException("모든 보드와 레일을 연결할 탭 공간이 없습니다. 마주 보는 직선 외곽을 맞추거나 탭 폭과 개수를 조정하세요.");
+        return RoutedPanel.Finish(material, cutouts, bites, tabs.Count, panelBounds, routing) with { MixedTabs = tabs };
+
+        bool Fits(Bridge bridge, decimal center) => Available(bridge)
+            .Any(span => center >= span.Start + reserve && center <= span.End - reserve);
+
+        List<Interval> Available(Bridge bridge)
         {
             var spans = bridge.Span.ToList();
             foreach (var blocker in parts.Where((_, index) => index != bridge.First && index != bridge.Second)
@@ -103,45 +157,34 @@ internal static class MixedRouting
                     .Where(span => span.End > span.Start).ToList();
             }
 
-            var half = routing.TabWidth / 2;
-            var reserve = half + routing.CutterDiameter;
-            var run = spans.Where(s => s.End - s.Start >= 2 * reserve + (routing.TabsPerEdge - 1) *
-                    (routing.TabWidth + routing.CutterDiameter))
-                .OrderByDescending(s => s.End - s.Start).FirstOrDefault();
-            if (run.End <= run.Start)
-                continue;
+            return spans;
+        }
 
+        void AddTab(Bridge bridge, decimal center)
+        {
             var a = parts[bridge.First].Bounds;
             var b = parts[bridge.Second].Bounds;
             var depth = bridge.Vertical ? Math.Min(a.Width, b.Width) : Math.Min(a.Height, b.Height);
             var overlap = Math.Min(.2m, Math.Min(routing.CutterDiameter, depth) / 4);
-            for (var tab = 0; tab < routing.TabsPerEdge; tab++)
-            {
-                var center = routing.TabsPerEdge == 1 ? (run.Start + run.End) / 2 : run.Start + reserve +
-                    tab * (run.End - run.Start - 2 * reserve) / (routing.TabsPerEdge - 1);
-                var area = bridge.Vertical ? new CamBounds(bridge.Start - overlap, center - half, bridge.End + overlap, center + half)
-                    : new CamBounds(center - half, bridge.Start - overlap, center + half, bridge.End + overlap);
-                tabAreas.Add(area);
-                material.Add(RoutedPanel.Rectangle(area.MinX, area.MinY, area.MaxX, area.MaxY));
-                if (!parts[bridge.First].IsRail) AddBites(bridge.Start + offset);
-                if (!parts[bridge.Second].IsRail) AddBites(bridge.End - offset);
+            var tab = new MixedTab(bridge.Vertical, bridge.Start, bridge.End, center);
+            var area = (tab with { Start = tab.Start - overlap, End = tab.End + overlap }).Bounds(half);
+            tabs.Add(tab);
+            tabAreas.Add(area);
+            material.Add(RoutedPanel.Rectangle(area.MinX, area.MinY, area.MaxX, area.MaxY));
+            if (!parts[bridge.First].IsRail) AddBites(bridge.Start + offset);
+            if (!parts[bridge.Second].IsRail) AddBites(bridge.End - offset);
 
-                void AddBites(decimal axis)
+            void AddBites(decimal axis)
+            {
+                var count = (int)((half - routing.BiteDiameter) / routing.BitePitch);
+                for (var hole = -count; hole <= count; hole++)
                 {
-                    var count = (int)((half - routing.BiteDiameter) / routing.BitePitch);
-                    for (var hole = -count; hole <= count; hole++)
-                    {
-                        var pos = center + hole * routing.BitePitch;
-                        bites.Add(bridge.Vertical ? new(decimal.Round(axis, 6), decimal.Round(pos, 6))
-                            : new(decimal.Round(pos, 6), decimal.Round(axis, 6)));
-                    }
+                    var pos = center + hole * routing.BitePitch;
+                    bites.Add(bridge.Vertical ? new(decimal.Round(axis, 6), decimal.Round(pos, 6))
+                        : new(decimal.Round(pos, 6), decimal.Round(axis, 6)));
                 }
             }
         }
-
-        if (Clipper.Union(material, FillRule.NonZero).Count(Clipper.IsPositive) != 1)
-            throw new InvalidDataException("모든 보드와 레일을 연결할 탭 공간이 없습니다. 마주 보는 직선 외곽을 맞추거나 탭 폭과 개수를 조정하세요.");
-        return RoutedPanel.Finish(material, cutouts, bites, tabAreas.Count, panelBounds, routing);
 
         void AddRail(CamBounds bounds, int face)
         {

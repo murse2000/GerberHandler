@@ -8,6 +8,7 @@ namespace GerberHandler;
 public partial class MainWindow
 {
     private IReadOnlyList<MixedBoard> mixedBoards = [];
+    private IReadOnlyList<MixedTab>? mixedTabs;
     private IReadOnlyList<MixedBoard>? savedMixedBoards;
 
     private void AddBoardZips(object sender, RoutedEventArgs e)
@@ -112,12 +113,17 @@ public partial class MainWindow
         CommitMixed(next, index);
     });
 
-    private void CommitMixed(IReadOnlyList<MixedBoard> next, int selection)
+    private void CommitMixed(IReadOnlyList<MixedBoard> next, int selection, IReadOnlyList<MixedTab>? restoredTabs = null)
     {
-        var options = ReadOptions();
+        var previousTabs = mixedTabs;
+        var nextTabs = restoredTabs ?? (next.SequenceEqual(mixedBoards) ? previousTabs : null);
+        var options = ReadOptions() with { MixedTabs = nextTabs };
         _ = MixedPanel.Placement(next, options);
         RenderMixed(next, options, selection);
         mixedBoards = next;
+        mixedTabs = nextTabs;
+        if (previousTabs is not null && nextTabs is null)
+            StatusLabel.Text += " · 보드 배치가 바뀌어 자동 탭으로 초기화했습니다.";
         source = next[0].Input;
         roleOverrides = next[0].RoleOverrides;
         lastInputPath = source.SourcePath;
@@ -147,7 +153,26 @@ public partial class MainWindow
             Run(Preview);
     }
 
-    private void RenderMixed(IReadOnlyList<MixedBoard> boards, PanelOptions options, int selection, bool strictMarks = false)
+    private void EditMixedTabs(IReadOnlyList<MixedTab>? tabs, CamPoint? addition)
+    {
+        try
+        {
+            var options = ReadOptions() with { MixedTabs = tabs };
+            var route = options.Routing ?? throw new InvalidDataException("탭 라우팅을 먼저 선택하세요.");
+            var (bounds, panel) = MixedPanel.Placement(mixedBoards, options);
+            var edited = MixedRouting.Build(mixedBoards, options, route, bounds, panel, addition);
+            options = options with { MixedTabs = tabs is null ? null : edited.MixedTabs };
+            RenderMixed(mixedBoards, options, MixedBoardList.SelectedIndex, preparedRoute: edited);
+            mixedTabs = options.MixedTabs;
+        }
+        catch (InvalidDataException error)
+        {
+            StatusLabel.Text = error.Message;
+        }
+    }
+
+    private void RenderMixed(IReadOnlyList<MixedBoard> boards, PanelOptions options, int selection, bool strictMarks = false,
+        RoutedPanel? preparedRoute = null)
     {
         var (bounds, panelBounds) = MixedPanel.Placement(boards, options);
         IReadOnlyList<CamPoint> fiducials = [];
@@ -160,7 +185,7 @@ public partial class MainWindow
         {
             try
             {
-                route = MixedRouting.Build(boards, options, routing, bounds, panelBounds);
+                route = preparedRoute ?? MixedRouting.Build(boards, options, routing, bounds, panelBounds);
                 if (issue is null)
                     output = MixedPanel.BuildWithRoute(boards, options, route);
             }
@@ -181,6 +206,7 @@ public partial class MainWindow
         }
         Viewer.SetEditableBoards(boards, selection);
         Viewer.SetEditableFiducials(fiducials);
+        Viewer.SetEditableTabs(route?.MixedTabs, options.Routing?.TabWidth ?? 0, options.Routing is not null && options.MixedTabs is not null);
         var mapped = output is not null && options.MapTwoLayerBoardsToOuterCopper &&
             output.Files.Any(file => file.Role == "Copper,L4,Bot") &&
             boards.Any(board => board.Input.Files.Any(file => file.Role == "Copper,L2,Bot"));
@@ -202,7 +228,7 @@ public partial class MainWindow
         SetProfiles(project.Profile);
         ApplyOptions(project.Options);
         MixedGap.Text = Number(project.MixedGap);
-        CommitMixed(boards, 0);
+        CommitMixed(boards, 0, project.MixedTabs);
         projectPath = path;
         saved = null;
         savedLayout = null;

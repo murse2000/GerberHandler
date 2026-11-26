@@ -36,6 +36,7 @@ public partial class MainWindow : Window
         Viewer.FiducialsMoved += MoveFiducials;
         Viewer.BoardSelected += index => MixedBoardList.SelectedIndex = index;
         Viewer.BoardMoved += MoveMixedBoard;
+        Viewer.TabsEdited += EditMixedTabs;
         Run(() =>
         {
             if (File.Exists(PresetPath))
@@ -179,6 +180,7 @@ public partial class MainWindow : Window
     private void UseSource(CamInput input)
     {
         mixedBoards = [];
+        mixedTabs = null;
         savedMixedBoards = null;
         MapOuterCopper.IsChecked = false;
         RefreshMixedControls(-1);
@@ -637,7 +639,7 @@ public partial class MainWindow : Window
     private Project Snapshot() => new(RequireSource().SourcePath, ReadOptions(), Presets.SelectedItem as Profile, roleOverrides,
         mixedBoards.Count == 0 ? null : mixedBoards.Select(board => new MixedPlacement(board.Input.SourcePath, board.Origin,
             board.RoleOverrides, board.QuarterTurns)).ToArray(),
-        mixedBoards.Count == 0 ? MixedPanel.DefaultGap : ReadMixedGap());
+        mixedBoards.Count == 0 ? MixedPanel.DefaultGap : ReadMixedGap(), mixedTabs);
 
     private string SnapshotText() => JsonSerializer.Serialize(Snapshot(), JsonOptions);
 
@@ -653,6 +655,7 @@ public partial class MainWindow : Window
         ColumnGap = ReadNumber(ColumnGap.Text),
         FillGaps = TabRouting.IsChecked != true && FillGaps.IsChecked == true,
         MapTwoLayerBoardsToOuterCopper = MapOuterCopper.IsChecked == true,
+        MixedTabs = mixedTabs,
         Routing = TabRouting.IsChecked == true ? new RoutingOptions(ReadNumber(RailChannel.Text), ReadNumber(CutterDiameter.Text),
             ReadNumber(TabWidth.Text), PositiveInteger(TabsPerEdge), ReadNumber(BiteDiameter.Text), ReadNumber(BitePitch.Text)) : null
     };
@@ -756,7 +759,7 @@ public partial class MainWindow : Window
     }
 
     private sealed record Project(string SourcePath, PanelOptions Options, Profile? Profile, IReadOnlyDictionary<string, string>? RoleOverrides,
-        MixedPlacement[]? Boards = null, decimal MixedGap = MixedPanel.DefaultGap);
+        MixedPlacement[]? Boards = null, decimal MixedGap = MixedPanel.DefaultGap, IReadOnlyList<MixedTab>? MixedTabs = null);
 
     private sealed record Cell(int Row, int Column)
     {

@@ -96,7 +96,7 @@ internal static class MixedPanel
             {
                 try
                 {
-                    _ = MixedRouting.Build(candidate.Boards, options, enabled, candidate.Content, candidate.Panel);
+                    _ = MixedRouting.Build(candidate.Boards, options with { MixedTabs = null }, enabled, candidate.Content, candidate.Panel);
                     return candidate.Boards;
                 }
                 catch (InvalidDataException)

@@ -5,6 +5,7 @@ namespace GerberHandler;
 
 internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList<CamPoint> Bites, int TabCount)
 {
+    internal IReadOnlyList<MixedTab> MixedTabs { get; init; } = [];
     private const decimal UnitsPerMm = 1_000_000m;
     private const long ArcTolerance = 5_000;
 

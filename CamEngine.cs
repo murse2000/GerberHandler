@@ -31,6 +31,7 @@ public sealed record PanelOptions(int Rows, int Columns, decimal RailLeft, decim
     public bool FillGaps { get; init; }
     public RoutingOptions? Routing { get; init; }
     public bool MapTwoLayerBoardsToOuterCopper { get; init; }
+    internal IReadOnlyList<MixedTab>? MixedTabs { get; init; }
 
     internal bool HasGap => Columns > 1 && ColumnGap > 0 || Rows > 1 && RowGap > 0;
     internal decimal PitchX(CamBounds bounds) => bounds.Width + ColumnGap;

@@ -32,11 +32,9 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
             throw new InvalidDataException("두 보드 쪽 마우스바이트가 겹치지 않도록 가공 간격을 늘리세요.");
 
         var outline = CamEngine.Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal)));
-        var contours = CamEngine.OutlineContours(outline);
-        if (contours.Count != 1)
-            throw new InvalidDataException("탭 라우팅은 외곽이 하나인 PCB를 지원합니다. 내부 컷아웃은 별도 가공이 필요합니다.");
-        var shape = Positive(new Path64(contours[0].SkipLast(1).Select(Scale)));
+        var (shape, sourceCutouts) = SplitProfile(outline);
         var material = new Paths64();
+        var cutouts = new Paths64();
         var bites = new List<CamPoint>();
         var tabs = 0;
         var rail = CamEngine.RailLimit(boards, options);
@@ -57,6 +55,8 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
                 var dx = column * options.PitchX(source);
                 var dy = row * options.PitchY(source);
                 material.Add(Clipper.TranslatePath(shape, Scale(dx), Scale(dy)));
+                foreach (var cutout in sourceCutouts)
+                    cutouts.Add(Clipper.TranslatePath(cutout, Scale(dx), Scale(dy)));
                 if (column == 0 && options.RailLeft > 0) AddTabs(true, rail.MinX, source.MinX, dy, left, false, true);
                 if (column + 1 < options.Columns) AddTabs(true, source.MaxX + dx, source.MinX + dx + options.PitchX(source), dy, betweenColumns, true, true);
                 else if (options.RailRight > 0) AddTabs(true, source.MaxX + dx, rail.MaxX, dy, right, true, false);
@@ -65,7 +65,7 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
                 else if (options.RailTop > 0) AddTabs(false, source.MaxY + dy, rail.MaxY, dx, top, true, false);
             }
 
-        return Finish(material, bites, tabs, panel, dimensions);
+        return Finish(material, cutouts, bites, tabs, panel, dimensions);
 
         (decimal Start, decimal End)[] EdgeRanges(bool vertical, decimal axis) => outline
             .Where(line => line.Kind == "Line" && line.Points.All(point => (vertical ? point.X : point.Y) == axis))
@@ -106,7 +106,31 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
         }
     }
 
-    internal static RoutedPanel Finish(Paths64 material, IReadOnlyList<CamPoint> bites, int tabs, CamBounds panel, RoutingOptions dimensions)
+    internal static (Path64 Outer, Paths64 Cutouts) SplitProfile(IReadOnlyList<CamShape> outline)
+    {
+        var paths = CamEngine.OutlineContours(outline)
+            .Select(contour => Positive(new Path64(contour.SkipLast(1).Select(Scale))))
+            .OrderByDescending(Clipper.Area).ToArray();
+        var outer = paths[0];
+        var cutouts = new Paths64(paths.Skip(1));
+        if (cutouts.Count > 0)
+        {
+            var profile = new PolyTree64();
+            var clipper = new Clipper64();
+            clipper.AddSubject([outer]);
+            clipper.AddClip(cutouts);
+            clipper.Execute(ClipType.Difference, FillRule.NonZero, profile);
+            var outerArea = Clipper.Area(outer);
+            // Clipper의 부동소수점 면적 계산은 경계점 순서에 따라 반올림 차이가 생긴다.
+            if (profile.Count != 1 || profile[0].Count != cutouts.Count ||
+                Math.Abs(profile[0].Area() - (outerArea - Clipper.Area(cutouts))) > outerArea * 1e-13)
+                throw new InvalidDataException("탭 라우팅에는 한 개의 외곽과 외곽 안에서 서로 분리된 내부 컷아웃이 필요합니다.");
+        }
+        return (outer, cutouts);
+    }
+
+    internal static RoutedPanel Finish(Paths64 material, Paths64 cutouts, IReadOnlyList<CamPoint> bites, int tabs,
+        CamBounds panel, RoutingOptions dimensions)
     {
         var outer = new Paths64 { Rectangle(panel.MinX, panel.MinY, panel.MaxX, panel.MaxY) };
         var boardMaterial = Clipper.Union(material, FillRule.NonZero);
@@ -125,7 +149,8 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
             JoinType.Round, EndType.Polygon, 2, ArcTolerance);
         if (bites.Any(point => holeClearance.Any(path => Clipper.PointInPolygon(Scale(point), path) != PointInPolygonResult.IsOutside)))
             throw new InvalidDataException("마우스바이트가 라우팅 개구와 겹칩니다. 탭 폭과 홀 지름을 확인하세요.");
-        var lines = result.SelectMany(path => path.Select((point, index) =>
+        // 탭 주변만 공구 반경에 맞춰 처리하고 원래의 내부 컷아웃은 그대로 출력한다.
+        var lines = result.Concat(cutouts).SelectMany(path => path.Select((point, index) =>
             new CamLine(Unscale(point), Unscale(path[(index + 1) % path.Count])))).ToArray();
         return new RoutedPanel(lines, bites, tabs);
     }

@@ -26,6 +26,7 @@ internal static class MixedRouting
             throw new InvalidDataException("보드와 가이드 레일 사이에 공구 및 마우스바이트를 위한 공간이 필요합니다.");
 
         var material = new Paths64();
+        var cutouts = new Paths64();
         var parts = new List<Part>();
         foreach (var board in boards)
         {
@@ -40,10 +41,9 @@ internal static class MixedRouting
 
             var outline = CamEngine.Geometry(board.Input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal)))
                 .Select(board.Transform).ToArray();
-            var contour = CamEngine.OutlineContours(outline);
-            if (contour.Count != 1)
-                throw new InvalidDataException("혼합 탭 라우팅은 단일 외곽의 PCB를 지원합니다.");
-            material.Add(RoutedPanel.Positive(new Path64(contour[0].SkipLast(1).Select(RoutedPanel.Scale))));
+            var (outer, boardCutouts) = RoutedPanel.SplitProfile(outline);
+            material.Add(outer);
+            cutouts.AddRange(boardCutouts);
             parts.Add(new(bbox, [Side(true, bbox.MinX), Side(true, bbox.MaxX), Side(false, bbox.MinY), Side(false, bbox.MaxY)], false));
 
             Interval[] Side(bool vertical, decimal axis) => outline
@@ -141,7 +141,7 @@ internal static class MixedRouting
 
         if (Clipper.Union(material, FillRule.NonZero).Count(Clipper.IsPositive) != 1)
             throw new InvalidDataException("모든 보드와 레일을 연결할 탭 공간이 없습니다. 마주 보는 직선 외곽을 맞추거나 탭 폭과 개수를 조정하세요.");
-        return RoutedPanel.Finish(material, bites, tabAreas.Count, panelBounds, routing);
+        return RoutedPanel.Finish(material, cutouts, bites, tabAreas.Count, panelBounds, routing);
 
         void AddRail(CamBounds bounds, int face)
         {

@@ -13,6 +13,8 @@ public sealed class PanelView : UserControl
     private static readonly Brush CanvasColor = BrushOf(18, 25, 32);
     private static readonly Brush BoardColor = BrushOf(26, 46, 48);
     private static readonly Brush SurfaceColor = BrushOf(28, 94, 74);
+    private static readonly Brush GuideColor = BrushOf(45, 117, 126);
+    private static readonly Brush FiducialColor = BrushOf(251, 225, 138);
     private static readonly Brush CopperColor = BrushOf(219, 164, 77);
     private static readonly Brush ProfileColor = BrushOf(160, 193, 205);
     private static readonly Brush CutColor = BrushOf(239, 170, 94);
@@ -31,6 +33,9 @@ public sealed class PanelView : UserControl
     private HashSet<string> visible = new(StringComparer.OrdinalIgnoreCase);
     private Rect board;
     private IReadOnlyList<IReadOnlyList<CamPoint>> outline = [];
+    private Geometry substrate = Geometry.Empty;
+    private IReadOnlyList<Rect> guideAreas = [];
+    private IReadOnlyDictionary<string, string> layerColors = new Dictionary<string, string>();
     private double zoomFactor = 1;
     private Vector pan;
     private Point? dragStart;
@@ -81,32 +86,37 @@ public sealed class PanelView : UserControl
         viewport.SizeChanged += (_, _) => UpdateCamera();
     }
 
-    public void SetData(IReadOnlyList<CamFile> files, CamBounds bounds)
+    public void SetData(IReadOnlyList<CamFile> files, CamBounds bounds) => SetData(files, bounds, []);
+
+    internal void SetPanel(IReadOnlyList<CamFile> files, CamBounds panel, CamBounds source, CamBounds boards, PanelOptions options) =>
+        SetData(files, panel, LayoutFillAreas(source, boards, panel, options));
+
+    private void SetData(IReadOnlyList<CamFile> files, CamBounds bounds, IReadOnlyList<CamBounds> fills)
     {
         var nextBoard = ToRect(bounds);
         var nextLayers = files.Select(file => BuildLayer(file, CamEngine.Geometry(file), nextBoard)).ToArray();
         var nextOutline = CamEngine.OutlineContours(nextLayers.Single(layer => layer.Role.StartsWith("Profile", StringComparison.Ordinal)).Shapes);
-        ApplyData(nextBoard, nextLayers, nextOutline);
+        ApplyData(nextBoard, nextLayers, nextOutline, fills);
     }
 
-    internal void SetLayout(CamInput input, PanelOptions options, CamBounds boards, CamBounds panel)
+    internal void SetLayout(CamInput input, PanelOptions options, CamBounds boards, CamBounds panel, IReadOnlyList<CamPoint> fiducials)
     {
         var nextBoard = ToRect(panel);
         var offsets = Enumerable.Range(0, options.Rows).SelectMany(row => Enumerable.Range(0, options.Columns)
-            .Select(column => new CamPoint(column * input.Bounds.Width, row * input.Bounds.Height))).ToArray();
-        var railContours = new[]
-        {
-            new CamBounds(panel.MinX, panel.MinY, boards.MinX, panel.MaxY),
-            new CamBounds(boards.MaxX, panel.MinY, panel.MaxX, panel.MaxY),
-            new CamBounds(boards.MinX, panel.MinY, boards.MaxX, boards.MinY),
-            new CamBounds(boards.MinX, boards.MaxY, boards.MaxX, panel.MaxY)
-        }.Where(rail => rail.Width > 0 && rail.Height > 0).Select(RectangleContour).ToArray();
+            .Select(column => new CamPoint(column * options.PitchX(input.Bounds), row * options.PitchY(input.Bounds)))).ToArray();
+        var fills = LayoutFillAreas(input.Bounds, boards, panel, options);
+        var railContours = fills.Select(RectangleContour).ToArray();
         var nextLayers = new List<Layer>();
         var nextOutline = new List<IReadOnlyList<CamPoint>>();
         foreach (var file in input.Files)
         {
             var shapes = CamEngine.Geometry(file);
             var translated = offsets.SelectMany(offset => shapes.Select(shape => CamEngine.Translate(shape, offset.X, offset.Y))).ToList();
+            if (file.Role == "Copper,L1,Top")
+                translated.AddRange(fiducials.Select(point => new CamShape("Flash", [point], options.FiducialDiameter,
+                    options.FiducialDiameter, true, true, true)));
+            if (file.Role == "Soldermask,Top" && CamEngine.GerberAttribute(file.Text, "FilePolarity") == "Negative")
+                translated.AddRange(fiducials.Select(point => new CamShape("Flash", [point], options.MaskDiameter, options.MaskDiameter, true, true)));
             if (file.Role.StartsWith("Profile", StringComparison.Ordinal))
             {
                 // 보드 외곽이 서로 접해도 각 원본 경계는 독립된 폐곡선으로 유지한다.
@@ -119,7 +129,32 @@ public sealed class PanelView : UserControl
             }
             nextLayers.Add(BuildLayer(file, translated, nextBoard));
         }
-        ApplyData(nextBoard, nextLayers, nextOutline);
+        ApplyData(nextBoard, nextLayers, nextOutline, fills);
+    }
+
+    private static IReadOnlyList<CamBounds> LayoutFillAreas(CamBounds source, CamBounds boards, CamBounds panel, PanelOptions options)
+    {
+        var areas = new List<CamBounds>
+        {
+            new(panel.MinX, panel.MinY, boards.MinX, panel.MaxY), new(boards.MaxX, panel.MinY, panel.MaxX, panel.MaxY),
+            new(boards.MinX, panel.MinY, boards.MaxX, boards.MinY), new(boards.MinX, boards.MaxY, boards.MaxX, panel.MaxY)
+        };
+        if (options.FillGaps)
+        {
+            for (var row = 0; row < options.Rows; row++)
+            {
+                var y = source.MinY + row * options.PitchY(source);
+                if (row + 1 < options.Rows && options.RowGap > 0)
+                    areas.Add(new(boards.MinX, y + source.Height, boards.MaxX, y + options.PitchY(source)));
+                if (options.ColumnGap > 0)
+                    for (var column = 1; column < options.Columns; column++)
+                    {
+                        var x = source.MinX + column * options.PitchX(source);
+                        areas.Add(new(x - options.ColumnGap, y, x, y + source.Height));
+                    }
+            }
+        }
+        return areas.Where(area => area.Width > 0 && area.Height > 0).ToArray();
     }
 
     private static Rect ToRect(CamBounds bounds) => new((double)bounds.MinX, -(double)bounds.MaxY,
@@ -129,12 +164,23 @@ public sealed class PanelView : UserControl
         [new(bounds.MinX, bounds.MinY), new(bounds.MaxX, bounds.MinY), new(bounds.MaxX, bounds.MaxY),
             new(bounds.MinX, bounds.MaxY), new(bounds.MinX, bounds.MinY)];
 
-    private void ApplyData(Rect nextBoard, IReadOnlyList<Layer> nextLayers, IReadOnlyList<IReadOnlyList<CamPoint>> nextOutline)
+    private void ApplyData(Rect nextBoard, IReadOnlyList<Layer> nextLayers, IReadOnlyList<IReadOnlyList<CamPoint>> nextOutline,
+        IReadOnlyList<CamBounds> fills)
     {
         var sameBoard = hasData && board == nextBoard;
         board = nextBoard;
         layers = nextLayers;
         outline = nextOutline;
+        guideAreas = fills.Select(ToRect).ToArray();
+        var materialOutline = new StreamGeometry { FillRule = FillRule.EvenOdd };
+        using (var context = materialOutline.Open())
+            foreach (var contour in outline)
+            {
+                context.BeginFigure(FromCam(contour[0]), isFilled: true, isClosed: true);
+                context.PolyLineTo(contour.Skip(1).Select(FromCam).ToArray(), isStroked: true, isSmoothJoin: false);
+            }
+        materialOutline.Freeze();
+        substrate = materialOutline;
         visible = nextLayers.Select(layer => layer.Role).ToHashSet(StringComparer.OrdinalIgnoreCase);
         differences = [];
         hasData = board.Width > 0 && board.Height > 0;
@@ -152,6 +198,19 @@ public sealed class PanelView : UserControl
     public void SetVisibleRoles(IEnumerable<string> roles)
     {
         visible = roles.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        InvalidateViews();
+    }
+
+    internal void SetLayerColors(IReadOnlyDictionary<string, string> colors)
+    {
+        layerColors = colors;
+        if (!hasData)
+            return;
+        layers = layers.Select(layer =>
+        {
+            var brush = LayerBrush(layer.Role);
+            return layer with { Color = brush, PlanDrawing = MakePlanDrawing(layer.Role, layer.Elements, brush, board) };
+        }).ToArray();
         InvalidateViews();
     }
 
@@ -205,12 +264,26 @@ public sealed class PanelView : UserControl
         return button;
     }
 
-    private static Layer BuildLayer(CamFile file, IReadOnlyList<CamShape> shapes, Rect extent)
+    private Layer BuildLayer(CamFile file, IReadOnlyList<CamShape> shapes, Rect extent)
     {
         var elements = shapes.Select(shape => (Shape: shape, Geometry: ShapeGeometry(shape))).ToArray();
-        var color = file.Role.Split(',')[0] switch
+        var brush = LayerBrush(file.Role);
+        return new Layer(file.Role, file.IsDrill, shapes, elements, brush,
+            CamEngine.GerberAttribute(file.Text, "FilePolarity") == "Positive", MakePlanDrawing(file.Role, elements, brush, extent));
+    }
+
+    private Brush LayerBrush(string role) => layerColors.TryGetValue(role, out var hex) && LayerStyleEditor.TryColor(hex, out var color)
+        ? BrushOf(color.R, color.G, color.B) : DefaultLayerBrush(role);
+
+    internal static string DefaultLayerHex(string role)
+    {
+        var color = ((SolidColorBrush)DefaultLayerBrush(role)).Color;
+        return $"#{color.R:X2}{color.G:X2}{color.B:X2}";
+    }
+
+    private static Brush DefaultLayerBrush(string role) => role.Split(',')[0] switch
         {
-            "Copper" => file.Role.EndsWith(",Bot", StringComparison.OrdinalIgnoreCase) ? BrushOf(104, 171, 236) : CopperColor,
+            "Copper" => role.EndsWith(",Bot", StringComparison.OrdinalIgnoreCase) ? BrushOf(104, 171, 236) : CopperColor,
             "Soldermask" => BrushOf(104, 213, 142),
             "Legend" => BrushOf(236, 233, 213),
             "Paste" => BrushOf(205, 205, 219),
@@ -219,13 +292,15 @@ public sealed class PanelView : UserControl
             "Plated" or "NonPlated" => BrushOf(133, 226, 230),
             _ => ProfileColor
         };
+
+    private static DrawingGroup MakePlanDrawing(string role, (CamShape Shape, Geometry Geometry)[] elements, Brush color, Rect extent)
+    {
         var group = new DrawingGroup();
         using (var drawing = group.Open())
             DrawLayer(drawing, elements, color, extent);
-        group.Opacity = file.Role.StartsWith("Soldermask,", StringComparison.OrdinalIgnoreCase) ? 0.58 : 0.92;
+        group.Opacity = role.StartsWith("Soldermask,", StringComparison.OrdinalIgnoreCase) ? 0.58 : 0.92;
         group.Freeze();
-        return new Layer(file.Role, file.IsDrill, shapes, elements, color,
-            CamEngine.GerberAttribute(file.Text, "FilePolarity") == "Positive", group);
+        return group;
     }
 
     private static Geometry ShapeGeometry(CamShape shape)
@@ -320,7 +395,9 @@ public sealed class PanelView : UserControl
         var view = new Matrix(PlanScale, 0, 0, PlanScale,
             PlanCenter.X - Center(board).X * PlanScale, PlanCenter.Y - Center(board).Y * PlanScale);
         drawing.PushTransform(new MatrixTransform(view));
-        drawing.DrawRectangle(BoardColor, null, board);
+        drawing.DrawGeometry(BoardColor, null, substrate);
+        foreach (var area in guideAreas)
+            drawing.DrawRectangle(GuideColor, null, area);
         foreach (var layer in VisibleLayers().OrderBy(LayerOrder))
             drawing.DrawDrawing(layer.PlanDrawing);
         foreach (var (shape, brush) in differences)
@@ -459,15 +536,7 @@ public sealed class PanelView : UserControl
         nextScene.Children.Add(new DirectionalLight(Color.FromRgb(145, 145, 145), new Vector3D(0.5, -0.4, 1)));
         if (hasData)
         {
-            var substrate = new StreamGeometry { FillRule = FillRule.EvenOdd };
-            using (var context = substrate.Open())
-                foreach (var contour in outline)
-                {
-                    context.BeginFigure(FromCam(contour[0]), isFilled: true, isClosed: true);
-                    context.PolyLineTo(contour.Skip(1).Select(FromCam).ToArray(), isStroked: true, isSmoothJoin: false);
-                }
-            substrate.Freeze();
-            var holes = layers.Where(layer => layer.IsDrill).SelectMany(layer => layer.Shapes)
+            var holes = VisibleLayers().Where(layer => layer.IsDrill).SelectMany(layer => layer.Shapes)
                 .Where(shape => ThroughHole(shape) && substrate.FillContains(FromCam(shape.Points[0])))
                 .DistinctBy(shape => (shape.Points[0], shape.Width)).ToArray();
             AddFace(nextScene, substrate, holes, top: true);
@@ -494,10 +563,12 @@ public sealed class PanelView : UserControl
             foreach (var hole in holes)
                 holeGroup.Children.Add(ShapeGeometry(hole));
             drawing.PushClip(Combine(substrate, holeGroup, GeometryCombineMode.Exclude));
-            drawing.DrawRectangle(SurfaceColor, null, board);
             var side = top ? ",Top" : ",Bot";
             var sideLayers = VisibleLayers().Where(layer => layer.Role.EndsWith(side, StringComparison.OrdinalIgnoreCase)).ToArray();
             var mask = sideLayers.FirstOrDefault(layer => layer.Role.StartsWith("Soldermask,", StringComparison.OrdinalIgnoreCase));
+            drawing.DrawRectangle(mask is not null && layerColors.ContainsKey(mask.Role) ? mask.Color : SurfaceColor, null, board);
+            foreach (var area in guideAreas)
+                drawing.DrawRectangle(GuideColor, null, area);
             if (mask is not null)
             {
                 var maskGeometry = LayerArea(mask);
@@ -505,14 +576,28 @@ public sealed class PanelView : UserControl
                 drawing.PushClip(openings);
             }
             foreach (var copper in sideLayers.Where(layer => layer.Role.StartsWith("Copper,", StringComparison.OrdinalIgnoreCase)))
-                DrawLayer(drawing, copper.Elements, CopperColor, board);
+                DrawLayer(drawing, copper.Elements, layerColors.ContainsKey(copper.Role) ? copper.Color : CopperColor, board);
             if (mask is not null)
                 drawing.Pop();
             foreach (var legend in sideLayers.Where(layer => layer.Role.StartsWith("Legend,", StringComparison.OrdinalIgnoreCase)))
                 DrawLayer(drawing, legend.Elements, legend.Color, board);
             foreach (var cut in VisibleLayers().Where(layer => layer.Role.StartsWith("Vcut", StringComparison.OrdinalIgnoreCase)))
                 foreach (var shape in cut.Shapes.Where(shape => shape.Points.Count > 1))
-                    drawing.DrawLine(new Pen(CutColor, Math.Max(0.12, 2 / pixelScale)), FromCam(shape.Points[0]), FromCam(shape.Points[^1]));
+                {
+                    var from = FromCam(shape.Points[0]);
+                    var to = FromCam(shape.Points[^1]);
+                    drawing.DrawLine(new Pen(CanvasColor, 5 / pixelScale), from, to);
+                    drawing.DrawLine(new Pen(cut.Color, Math.Max(0.15, 3 / pixelScale)), from, to);
+                }
+            foreach (var copper in sideLayers.Where(layer => layer.Role.StartsWith("Copper,", StringComparison.OrdinalIgnoreCase)))
+                foreach (var mark in copper.Shapes.Where(shape => shape.IsFiducial && shape.Kind == "Flash"))
+                {
+                    var center = FromCam(mark.Points[0]);
+                    var radius = (double)mark.Width / 2;
+                    drawing.DrawEllipse(FiducialColor, new Pen(CanvasColor, 1 / pixelScale), center, radius, radius);
+                    var ring = Math.Max(radius + 2 / pixelScale, 4 / pixelScale);
+                    drawing.DrawEllipse(null, new Pen(FiducialColor, 1.5 / pixelScale), center, ring, ring);
+                }
             drawing.Pop();
             drawing.Pop();
         }

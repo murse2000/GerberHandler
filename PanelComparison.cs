@@ -15,8 +15,8 @@ internal static class PanelComparison
         var missing = new List<CamShape>();
         var added = new List<CamShape>();
         var findings = new List<PanelFinding>();
-        var deltaX = column * original.Bounds.Width;
-        var deltaY = row * original.Bounds.Height;
+        var deltaX = column * options.PitchX(original.Bounds);
+        var deltaY = row * options.PitchY(original.Bounds);
         var left = original.Bounds.MinX + deltaX;
         var right = original.Bounds.MaxX + deltaX;
         var bottom = original.Bounds.MinY + deltaY;
@@ -60,8 +60,8 @@ internal static class PanelComparison
         return new(missing, added, findings);
 
         bool InBoardArea(CamPoint point) => point.X >= original.Bounds.MinX && point.Y >= original.Bounds.MinY &&
-            point.X <= original.Bounds.MaxX + (options.Columns - 1) * original.Bounds.Width &&
-            point.Y <= original.Bounds.MaxY + (options.Rows - 1) * original.Bounds.Height;
+            point.X <= original.Bounds.MaxX + (options.Columns - 1) * options.PitchX(original.Bounds) &&
+            point.Y <= original.Bounds.MaxY + (options.Rows - 1) * options.PitchY(original.Bounds);
 
         bool Owns(IReadOnlyList<CamPoint> points)
         {
@@ -70,8 +70,8 @@ internal static class PanelComparison
             var x = (points.Min(p => p.X) + points.Max(p => p.X)) / 2;
             var y = (points.Min(p => p.Y) + points.Max(p => p.Y)) / 2;
             return x >= left - Tolerance && y >= bottom - Tolerance &&
-                (column == options.Columns - 1 ? x <= right + Tolerance : x < right - Tolerance) &&
-                (row == options.Rows - 1 ? y <= top + Tolerance : y < top - Tolerance);
+                (column == options.Columns - 1 || options.ColumnGap > 0 ? x <= right + Tolerance : x < right - Tolerance) &&
+                (row == options.Rows - 1 || options.RowGap > 0 ? y <= top + Tolerance : y < top - Tolerance);
         }
     }
 

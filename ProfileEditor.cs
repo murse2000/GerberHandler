@@ -6,10 +6,26 @@ namespace GerberHandler;
 
 internal sealed record Profile(string Name, string Source, DateOnly Date, decimal MinWidth, decimal MaxWidth,
     decimal MinHeight, decimal MaxHeight, decimal MinRail, decimal Clearance, decimal FiducialDiameter,
-    decimal MaskDiameter, decimal ToolingDiameter)
+    decimal MaskDiameter, decimal ToolingDiameter, decimal MinCutSpacing = 0)
 {
     public IEnumerable<PanelFinding> Validate(CamPanel panel, PanelOptions options)
     {
+        if (options.HasGap && MinCutSpacing <= 0)
+            yield return new("빈 PCB 스트립을 제조하려면 프리셋에 최소 V-cut 간격을 입력하세요.", null);
+        if (MinCutSpacing > 0)
+        {
+            foreach (var axis in panel.Cuts.GroupBy(cut => cut.From.X == cut.To.X))
+            {
+                var positions = axis.Select(cut => axis.Key ? cut.From.X : cut.From.Y).Order().ToArray();
+                for (var index = 1; index < positions.Length; index++)
+                {
+                    var distance = positions[index] - positions[index - 1];
+                    if (distance < MinCutSpacing)
+                        yield return new($"V-cut 간격 {MainWindow.Number(distance)} mm · 최솟값 {MainWindow.Number(MinCutSpacing)} mm",
+                            axis.Key ? new CamPoint(positions[index], panel.Bounds.MinY) : new CamPoint(panel.Bounds.MinX, positions[index]));
+                }
+            }
+        }
         if (panel.Bounds.Width < MinWidth || panel.Bounds.Width > MaxWidth)
             yield return new($"패널 가로 {MainWindow.Number(panel.Bounds.Width)} mm · 허용 {MainWindow.Number(MinWidth)}–{MainWindow.Number(MaxWidth)} mm", new CamPoint(panel.Bounds.MaxX, panel.Bounds.MinY));
         if (panel.Bounds.Height < MinHeight || panel.Bounds.Height > MaxHeight)
@@ -55,6 +71,7 @@ internal static class ProfileEditor
         var maxHeight = AddField("최대 패널 세로 (mm)");
         var rail = AddField("최소 레일 폭 (mm)");
         var clearance = AddField("V-cut에서 동박·홀까지 최소 거리 (mm)");
+        var cutSpacing = AddField("최소 V-cut 간격 (mm, 빈 PCB 스트립 제조 시 필요)");
         var fiducial = AddField("피두셜 동박 지름 (mm)");
         var mask = AddField("피두셜 마스크 개구 지름 (mm)");
         var tooling = AddField("고정 홀 지름 (mm)");
@@ -70,11 +87,11 @@ internal static class ProfileEditor
             {
                 var profile = new Profile(name.Text.Trim(), source.Text.Trim(), DateOnly.FromDateTime(DateTime.Today),
                     Value(minWidth), Value(maxWidth), Value(minHeight), Value(maxHeight), Value(rail), Value(clearance),
-                    Value(fiducial), Value(mask), Value(tooling));
+                    Value(fiducial), Value(mask), Value(tooling), string.IsNullOrWhiteSpace(cutSpacing.Text) ? 0 : Value(cutSpacing));
                 if (profile.Name.Length == 0 || profile.Source.Length == 0 || profile.MinWidth <= 0 || profile.MinHeight <= 0 ||
                     profile.MaxWidth < profile.MinWidth || profile.MaxHeight < profile.MinHeight || profile.MinRail < 0 ||
                     profile.Clearance <= 0 || profile.FiducialDiameter <= 0 || profile.MaskDiameter <= profile.FiducialDiameter ||
-                    profile.ToolingDiameter <= 0)
+                    profile.ToolingDiameter <= 0 || profile.MinCutSpacing < 0)
                     throw new InvalidDataException("이름, 기준 출처, 최소·최대 치수, 절단 여유와 홀·마크 지름을 확인하세요.");
                 result = profile;
                 dialog.DialogResult = true;

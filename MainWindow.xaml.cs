@@ -4,6 +4,8 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Media;
 using Microsoft.Win32;
 
 namespace GerberHandler;
@@ -13,6 +15,11 @@ public partial class MainWindow : Window
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly string PresetPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GerberHandler", "presets.json");
+    private static readonly string LayerColorsPath = Path.Combine(Path.GetDirectoryName(PresetPath)!, "layer-colors.json");
+    private static readonly Geometry EyeOpen = Geometry.Parse("M1 8 Q8 -1 15 8 Q8 17 1 8 M10 8 A2 2 0 1 1 6 8 A2 2 0 1 1 10 8");
+    private static readonly Geometry EyeClosed = Geometry.Parse("M1 8 Q8 15 15 8 M2 2 L14 14");
+    private Dictionary<string, string> layerColors = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> hiddenLayers = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly List<Profile> profiles = [];
     private CamInput? source;
@@ -31,6 +38,11 @@ public partial class MainWindow : Window
             if (File.Exists(PresetPath))
                 profiles.AddRange(Read<List<Profile>>(PresetPath));
             SetProfiles(null);
+            if (File.Exists(LayerColorsPath))
+            {
+                layerColors = new(Read<Dictionary<string, string>>(LayerColorsPath), StringComparer.OrdinalIgnoreCase);
+                Viewer.SetLayerColors(layerColors);
+            }
         });
     }
 
@@ -273,17 +285,25 @@ public partial class MainWindow : Window
     {
         var project = Snapshot();
         var input = RequireSource();
-        if (CamEngine.VCutOutlineProblem(input) is { } problem)
+        var problem = CamEngine.VCutOutlineProblem(input);
+        if (problem is not null || project.Options.HasGap && !project.Options.FillGaps)
         {
             var (boards, layoutBounds) = CamEngine.PlacementBounds(input, project.Options);
-            Viewer.SetLayout(input, project.Options, boards, layoutBounds);
+            IReadOnlyList<CamPoint> fiducials = [];
+            string? markProblem = null;
+            try { fiducials = CamEngine.LayoutFiducials(input, boards, layoutBounds, project.Options); }
+            catch (InvalidDataException e) { markProblem = e.Message; }
+            Viewer.SetLayout(input, project.Options, boards, layoutBounds, fiducials);
             ShowLayers("배열 미리보기", input.Files, layoutBounds);
-            StatusLabel.Text = $"{project.Options.Rows * project.Options.Columns}장 · {Size(layoutBounds)} · {problem} 레일 마크와 절단선은 제조용 패널에서 표시됩니다.";
+            StatusLabel.Text = $"{project.Options.Rows * project.Options.Columns}장 · {Size(layoutBounds)} · " +
+                (problem ?? "열린 간격의 제조 ZIP에는 탭 라우팅이 필요합니다.");
+            if (markProblem is not null)
+                Findings.ItemsSource = new[] { new PanelFinding(markProblem, null) };
             return;
         }
 
         var panel = CamEngine.Build(input, project.Options);
-        ShowFiles("편집 중인 패널", panel.Files, panel.Bounds);
+        ShowPanel("편집 중인 패널", panel, input, project.Options);
         SetChecks(panel, project.Profile, false);
         var marks = string.Join(" / ", panel.Fiducials.Select(p => $"({Number(p.X)}, {Number(p.Y)})"));
         StatusLabel.Text = $"{project.Options.Rows * project.Options.Columns}장 · {Size(panel.Bounds)}" +
@@ -293,8 +313,9 @@ public partial class MainWindow : Window
     private void SavePanel(object sender, RoutedEventArgs e) => Run(() =>
     {
         var project = Snapshot();
-        var panel = CamEngine.Build(RequireSource(), project.Options);
-        ShowFiles("편집 중인 패널", panel.Files, panel.Bounds);
+        var input = RequireSource();
+        var panel = CamEngine.Build(input, project.Options);
+        ShowPanel("편집 중인 패널", panel, input, project.Options);
         if (!SetChecks(panel, project.Profile, true))
             return;
         if (panel.Warnings.Count > 0 && MessageBox.Show(this, string.Join(Environment.NewLine, panel.Warnings) +
@@ -343,7 +364,15 @@ public partial class MainWindow : Window
             throw new InvalidDataException("GerberHandler에서 출력한 패널 제조 ZIP을 선택하세요.");
 
         saved = input;
-        ShowFiles($"저장본 · {Path.GetFileName(input.SourcePath)}", input.Files, input.Bounds);
+        var title = $"저장본 · {Path.GetFileName(input.SourcePath)}";
+        if (source is { } original && savedLayout is { } layout)
+        {
+            var (boards, _) = CamEngine.PlacementBounds(original, layout.Options);
+            Viewer.SetPanel(input.Files, input.Bounds, original.Bounds, boards, layout.Options);
+            ShowLayers(title, input.Files, input.Bounds);
+        }
+        else
+            ShowFiles(title, input.Files, input.Bounds);
         if (source is not null)
         {
             var options = savedLayout?.Options ?? ReadOptions();
@@ -373,32 +402,71 @@ public partial class MainWindow : Window
         ShowLayers(title, files, bounds);
     }
 
+    private void ShowPanel(string title, CamPanel panel, CamInput input, PanelOptions options)
+    {
+        var (boards, _) = CamEngine.PlacementBounds(input, options);
+        Viewer.SetPanel(panel.Files, panel.Bounds, input.Bounds, boards, options);
+        ShowLayers(title, panel.Files, panel.Bounds);
+    }
+
     private void ShowLayers(string title, IReadOnlyList<CamFile> files, CamBounds bounds)
     {
         LayerList.Children.Clear();
         foreach (var group in files.GroupBy(file => file.Role))
         {
-            var box = new CheckBox
+            var role = group.Key;
+            var icon = new System.Windows.Shapes.Path { Width = 15, Height = 15, Stretch = Stretch.Uniform,
+                Stroke = Brushes.DarkSlateGray, StrokeThickness = 1.3 };
+            var toggle = new ToggleButton
             {
-                Content = group.Key,
-                ToolTip = string.Join(Environment.NewLine, group.Select(file => file.Name)),
-                Tag = group.Key,
-                IsChecked = true,
-                Margin = new Thickness(0, 4, 0, 4)
+                Content = icon, IsChecked = !hiddenLayers.Contains(role), Width = 27, Height = 24,
+                Margin = new Thickness(0, 2, 4, 2)
             };
-            box.Checked += UpdateLayers;
-            box.Unchecked += UpdateLayers;
-            LayerList.Children.Add(box);
+            void RefreshIcon()
+            {
+                var showing = toggle.IsChecked == true;
+                icon.Data = showing ? EyeOpen : EyeClosed;
+                toggle.ToolTip = showing ? $"{role} 숨기기" : $"{role} 보이기";
+                System.Windows.Automation.AutomationProperties.SetName(toggle, (string)toggle.ToolTip);
+            }
+            RefreshIcon();
+            toggle.Click += (_, _) =>
+            {
+                if (toggle.IsChecked == true) hiddenLayers.Remove(role);
+                else hiddenLayers.Add(role);
+                RefreshIcon();
+                UpdateLayers();
+            };
+            var row = new DockPanel { Tag = role };
+            DockPanel.SetDock(toggle, Dock.Left);
+            row.Children.Add(toggle);
+            row.Children.Add(new TextBlock { Text = role, VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis, ToolTip = string.Join(Environment.NewLine, group.Select(file => file.Name)) });
+            LayerList.Children.Add(row);
         }
 
         ViewLabel.Text = $"{title} · {Size(bounds)}";
         StatusLabel.Text = $"{files.Count}개 제조 파일";
         Findings.ItemsSource = null;
-        UpdateLayers(this, new RoutedEventArgs());
+        UpdateLayers();
     }
 
-    private void UpdateLayers(object sender, RoutedEventArgs e) => Viewer.SetVisibleRoles(
-        LayerList.Children.OfType<CheckBox>().Where(layer => layer.IsChecked == true).Select(layer => (string)layer.Tag));
+    private void UpdateLayers() => Viewer.SetVisibleRoles(
+        LayerList.Children.OfType<DockPanel>().Select(row => (string)row.Tag).Where(role => !hiddenLayers.Contains(role)));
+
+    private void EditLayerColors(object sender, RoutedEventArgs e) => Run(() =>
+    {
+        var roles = LayerList.Children.OfType<DockPanel>().Select(row => (string)row.Tag).Concat(layerColors.Keys)
+            .Distinct(StringComparer.OrdinalIgnoreCase).Order().ToArray();
+        if (roles.Length == 0)
+            throw new InvalidDataException("색상을 지정할 제조 레이어를 먼저 여세요.");
+        if (LayerStyleEditor.Show(this, roles, layerColors) is not { } settings)
+            return;
+        Directory.CreateDirectory(Path.GetDirectoryName(LayerColorsPath)!);
+        WriteAtomic(LayerColorsPath, JsonSerializer.Serialize(settings, JsonOptions));
+        layerColors = settings;
+        Viewer.SetLayerColors(settings);
+    });
 
     private void CompareCell(object sender, RoutedEventArgs e) => Run(() =>
     {
@@ -406,13 +474,13 @@ public partial class MainWindow : Window
         var output = saved ?? throw new InvalidDataException("비교할 패널 ZIP을 먼저 여세요.");
         var cell = Cells.SelectedItem as Cell ?? throw new InvalidDataException("비교할 배열 셀을 선택하세요.");
         var options = savedLayout?.Options ?? ReadOptions();
-        var expectedWidth = original.Bounds.Width * options.Columns + options.RailLeft + options.RailRight;
-        var expectedHeight = original.Bounds.Height * options.Rows + options.RailTop + options.RailBottom;
-        if (Math.Abs(output.Bounds.Width - expectedWidth) > 0.000001m || Math.Abs(output.Bounds.Height - expectedHeight) > 0.000001m)
+        var (boards, expected) = CamEngine.PlacementBounds(original, options);
+        if (output.Bounds != expected)
             throw new InvalidDataException("ZIP 외곽이 현재 원본과 배열·레일 설정에 맞지 않습니다.");
 
         var diff = PanelComparison.Compare(original, output, cell.Row, cell.Column, options);
-        ShowFiles($"저장본 비교 · {cell}", output.Files, output.Bounds);
+        Viewer.SetPanel(output.Files, output.Bounds, original.Bounds, boards, options);
+        ShowLayers($"저장본 비교 · {cell}", output.Files, output.Bounds);
         Viewer.ShowComparison(diff.Missing, diff.Added);
         Findings.ItemsSource = diff.Findings;
         StatusLabel.Text = $"{cell} · 원본 형상 차이 {diff.Missing.Count + diff.Added.Count}개";
@@ -495,13 +563,19 @@ public partial class MainWindow : Window
         Tooling.IsChecked == true, ReadNumber(ToolingDiameter.Text), (Presets.SelectedItem as Profile)?.Clearance ?? 0m)
     {
         FiducialPositions = ParsePositions(FiducialPositions.Text),
-        ToolingPositions = ParsePositions(ToolingPositions.Text)
+        ToolingPositions = ParsePositions(ToolingPositions.Text),
+        RowGap = ReadNumber(RowGap.Text),
+        ColumnGap = ReadNumber(ColumnGap.Text),
+        FillGaps = FillGaps.IsChecked == true
     };
 
     private void ApplyOptions(PanelOptions options)
     {
         Rows.Text = Number(options.Rows);
         Columns.Text = Number(options.Columns);
+        RowGap.Text = Number(options.RowGap);
+        ColumnGap.Text = Number(options.ColumnGap);
+        FillGaps.IsChecked = options.FillGaps;
         RailLeft.Text = Number(options.RailLeft);
         RailRight.Text = Number(options.RailRight);
         RailBottom.Text = Number(options.RailBottom);

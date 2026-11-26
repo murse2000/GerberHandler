@@ -18,6 +18,9 @@
                 <Separator />
                 <MenuItem Header="저장한 패널 ZIP 검토" Click="ReviewZip" />
             </MenuItem>
+            <MenuItem Header="설정(_S)">
+                <MenuItem Header="레이어 색상" Click="EditLayerColors" />
+            </MenuItem>
             <MenuItem Header="도움말(_H)">
                 <MenuItem Header="업데이트 확인" Click="CheckForUpdates" />
             </MenuItem>
@@ -66,11 +69,15 @@
                     <UniformGrid Columns="2" Margin="0,5">
                         <StackPanel Margin="0,0,8,0"><TextBlock Text="행 (Y)" /><TextBox x:Name="Rows" Text="1" /></StackPanel>
                         <StackPanel><TextBlock Text="열 (X)" /><TextBox x:Name="Columns" Text="1" /></StackPanel>
+                        <StackPanel Margin="0,0,8,0"><TextBlock Text="행 간격 (mm)" /><TextBox x:Name="RowGap" Text="0" /></StackPanel>
+                        <StackPanel><TextBlock Text="열 간격 (mm)" /><TextBox x:Name="ColumnGap" Text="0" /></StackPanel>
                         <StackPanel Margin="0,0,8,0"><TextBlock Text="왼쪽 레일 (mm)" /><TextBox x:Name="RailLeft" Text="5" /></StackPanel>
                         <StackPanel><TextBlock Text="오른쪽 레일 (mm)" /><TextBox x:Name="RailRight" Text="5" /></StackPanel>
                         <StackPanel Margin="0,0,8,0"><TextBlock Text="아래 레일 (mm)" /><TextBox x:Name="RailBottom" Text="5" /></StackPanel>
                         <StackPanel><TextBlock Text="위 레일 (mm)" /><TextBox x:Name="RailTop" Text="5" /></StackPanel>
                     </UniformGrid>
+                    <CheckBox x:Name="FillGaps" Content="간격을 빈 PCB로 채우기" Margin="0,0,0,5" />
+                    <TextBlock Text="커넥터 등 부품이 돌출되면 필요한 간격을 입력하세요." TextWrapping="Wrap" Margin="0,0,0,5" />
                     <Separator />
                     <TextBlock Text="조립용 마크" FontWeight="Bold" FontSize="16" />
                     <CheckBox x:Name="Fiducials" Content="상면 피두셜" IsChecked="True" Margin="0,8,0,3" />

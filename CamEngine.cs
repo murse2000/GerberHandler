@@ -26,6 +26,13 @@ public sealed record PanelOptions(int Rows, int Columns, decimal RailLeft, decim
 {
     public IReadOnlyList<CamPoint>? FiducialPositions { get; init; }
     public IReadOnlyList<CamPoint>? ToolingPositions { get; init; }
+    public decimal ColumnGap { get; init; }
+    public decimal RowGap { get; init; }
+    public bool FillGaps { get; init; }
+
+    internal bool HasGap => Columns > 1 && ColumnGap > 0 || Rows > 1 && RowGap > 0;
+    internal decimal PitchX(CamBounds bounds) => bounds.Width + ColumnGap;
+    internal decimal PitchY(CamBounds bounds) => bounds.Height + RowGap;
 }
 
 public sealed record CamPanel(IReadOnlyList<CamFile> Files, CamBounds Bounds, IReadOnlyList<CamLine> Cuts,
@@ -143,6 +150,8 @@ public static class CamEngine
         var source = input.Bounds;
         if (VCutOutlineProblem(input) is { } problem)
             throw Bad(problem);
+        if (options.HasGap && !options.FillGaps)
+            throw Bad("빈 공간을 둔 배열의 제조 ZIP을 만들려면 탭 라우팅이 필요합니다.");
 
         if (options.Fiducials && (options.FiducialDiameter <= 0 || options.MaskDiameter <= options.FiducialDiameter))
             throw Bad("피두셜 동박 지름과 그보다 큰 마스크 개구 지름을 지정하세요.");
@@ -155,7 +164,7 @@ public static class CamEngine
         if (input.Files.Any(file => file.Role.StartsWith("Profile,P", StringComparison.Ordinal)))
             throw Bad("도금된 외곽은 지원 대상에서 제외됩니다.");
 
-        var cuts = Cuts(source, boards, panel, options);
+        var cuts = Cuts(source, panel, options);
         var hasLeftCut = options.Columns > 1 || options.RailLeft > 0;
         var hasRightCut = options.Columns > 1 || options.RailRight > 0;
         var hasBottomCut = options.Rows > 1 || options.RailBottom > 0;
@@ -224,11 +233,14 @@ public static class CamEngine
         var copyCount = (long)options.Rows * options.Columns;
         if (options.Rows < 1 || options.Columns < 1 || copyCount > MaxCopies)
             throw Bad($"배열은 1개부터 {MaxCopies}개까지 지원합니다.");
-        if (new[] { options.RailLeft, options.RailRight, options.RailBottom, options.RailTop, options.CutClearance }
+        if (new[] { options.RailLeft, options.RailRight, options.RailBottom, options.RailTop, options.CutClearance, options.ColumnGap, options.RowGap }
             .Any(value => value is < 0 or > 10000))
-            throw Bad("레일 폭과 절단 이격은 0~10000 mm 범위여야 합니다.");
+            throw Bad("레일 폭, 배열 간격과 절단 이격은 0~10000 mm 범위여야 합니다.");
+        if (decimal.Round(options.ColumnGap, 6) != options.ColumnGap || decimal.Round(options.RowGap, 6) != options.RowGap)
+            throw Bad("배열 간격은 소수점 여섯 자리까지 입력하세요.");
         var source = input.Bounds;
-        var boards = source with { MaxX = source.MinX + options.Columns * source.Width, MaxY = source.MinY + options.Rows * source.Height };
+        var boards = source with { MaxX = source.MaxX + (options.Columns - 1) * options.PitchX(source),
+            MaxY = source.MaxY + (options.Rows - 1) * options.PitchY(source) };
         var panel = new CamBounds(boards.MinX - options.RailLeft, boards.MinY - options.RailBottom,
             boards.MaxX + options.RailRight, boards.MaxY + options.RailTop);
         if (panel.Width > 10000 || panel.Height > 10000)
@@ -240,6 +252,18 @@ public static class CamEngine
 
     internal static string? VCutOutlineProblem(CamInput input) => RectangleProblem(
         Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal))));
+
+    internal static IReadOnlyList<CamPoint> LayoutFiducials(CamInput input, CamBounds boards, CamBounds panel, PanelOptions options)
+    {
+        if (!options.Fiducials)
+            return [];
+        if (options.FiducialDiameter <= 0 || options.MaskDiameter <= options.FiducialDiameter)
+            throw Bad("피두셜 동박 지름과 그보다 큰 마스크 개구 지름을 지정하세요.");
+        if (!input.Files.Any(file => file.Role == "Soldermask,Top"))
+            throw Bad("피두셜을 지정하려면 상면 솔더마스크가 필요합니다.");
+        return Marks(panel, boards, Cuts(input.Bounds, panel, options), options.CutClearance,
+            options.MaskDiameter / 2, options.FiducialPositions, []);
+    }
 
     public static void Export(CamPanel panel, string path)
     {
@@ -345,26 +369,17 @@ public static class CamEngine
         return contours;
     }
 
-    private static List<CamLine> Cuts(CamBounds source, CamBounds boards, CamBounds panel, PanelOptions options)
+    private static List<CamLine> Cuts(CamBounds source, CamBounds panel, PanelOptions options)
     {
-        var cuts = new List<CamLine>();
-        for (var index = 0; index <= options.Columns; index++)
-        {
-            if ((index == 0 && boards.MinX == panel.MinX) ||
-                (index == options.Columns && boards.MaxX == panel.MaxX))
-                continue;
-            var x = source.MinX + index * source.Width;
-            cuts.Add(new CamLine(new(x, panel.MinY), new(x, panel.MaxY)));
-        }
-        for (var index = 0; index <= options.Rows; index++)
-        {
-            if ((index == 0 && boards.MinY == panel.MinY) ||
-                (index == options.Rows && boards.MaxY == panel.MaxY))
-                continue;
-            var y = source.MinY + index * source.Height;
-            cuts.Add(new CamLine(new(panel.MinX, y), new(panel.MaxX, y)));
-        }
-        return cuts;
+        // 스트립을 끼우면 양쪽 PCB 경계에 각각 절단선이 필요하다.
+        var vertical = Boundaries(source.MinX, source.MaxX, options.Columns, options.PitchX(source))
+            .Where(x => x > panel.MinX && x < panel.MaxX).Select(x => new CamLine(new(x, panel.MinY), new(x, panel.MaxY)));
+        var horizontal = Boundaries(source.MinY, source.MaxY, options.Rows, options.PitchY(source))
+            .Where(y => y > panel.MinY && y < panel.MaxY).Select(y => new CamLine(new(panel.MinX, y), new(panel.MaxX, y)));
+        return vertical.Concat(horizontal).ToList();
+
+        static IEnumerable<decimal> Boundaries(decimal min, decimal max, int count, decimal pitch) => Enumerable.Range(0, count)
+            .SelectMany(index => new[] { min + index * pitch, max + index * pitch }).Distinct();
     }
 
     private static List<CamPoint> Marks(CamBounds panel, CamBounds boards, IReadOnlyList<CamLine> cuts,
@@ -863,7 +878,7 @@ public static class CamEngine
             for (var column = 0; column < options.Columns; column++)
                 for (var row = 0; row < options.Rows; row++)
                     foreach (var hit in group)
-                        output.AppendLine(DrillPosition(new(hit.Point.X + column * bounds.Width, hit.Point.Y + row * bounds.Height)));
+                        output.AppendLine(DrillPosition(new(hit.Point.X + column * options.PitchX(bounds), hit.Point.Y + row * options.PitchY(bounds))));
         }
         if (marks.Count > 0)
         {
@@ -934,8 +949,8 @@ public static class CamEngine
                     for (var row = 0; row < options.Rows; row++)
                     {
                         output.AppendLine("%TD*%").AppendLine(initialPolarity).AppendLine(initialMode);
-                        var dx = column * bounds.Width;
-                        var dy = row * bounds.Height;
+                        var dx = column * options.PitchX(bounds);
+                        var dy = row * options.PitchY(bounds);
                         foreach (var command in body)
                         {
                             if (Operation.IsMatch(command))
@@ -950,9 +965,9 @@ public static class CamEngine
             }
             else
             {
-                X(bounds.MaxX + (options.Columns - 1) * bounds.Width);
-                Y(bounds.MaxY + (options.Rows - 1) * bounds.Height);
-                output.AppendLine($"%SRX{options.Columns}Y{options.Rows}I{Format(options.Columns > 1 ? bounds.Width : 0)}J{Format(options.Rows > 1 ? bounds.Height : 0)}*%");
+                X(bounds.MaxX + (options.Columns - 1) * options.PitchX(bounds));
+                Y(bounds.MaxY + (options.Rows - 1) * options.PitchY(bounds));
+                output.AppendLine($"%SRX{options.Columns}Y{options.Rows}I{Format(options.Columns > 1 ? options.PitchX(bounds) : 0)}J{Format(options.Rows > 1 ? options.PitchY(bounds) : 0)}*%");
                 foreach (var command in body)
                     output.AppendLine(command);
                 output.AppendLine("%SR*%");

@@ -30,6 +30,7 @@ public sealed class PanelView : UserControl
     private IReadOnlyList<(Geometry Geometry, Brush Brush)> differences = [];
     private HashSet<string> visible = new(StringComparer.OrdinalIgnoreCase);
     private Rect board;
+    private IReadOnlyList<IReadOnlyList<CamPoint>> outline = [];
     private double zoomFactor = 1;
     private Vector pan;
     private Point? dragStart;
@@ -84,9 +85,11 @@ public sealed class PanelView : UserControl
     {
         var nextBoard = new Rect((double)bounds.MinX, -(double)bounds.MaxY, (double)bounds.Width, (double)bounds.Height);
         var nextLayers = files.Select(file => BuildLayer(file, nextBoard)).ToArray();
+        var nextOutline = CamEngine.OutlineContours(nextLayers.Single(layer => layer.Role.StartsWith("Profile", StringComparison.Ordinal)).Shapes);
         var sameBoard = hasData && board == nextBoard;
         board = nextBoard;
         layers = nextLayers;
+        outline = nextOutline;
         visible = files.Select(file => file.Role).ToHashSet(StringComparer.OrdinalIgnoreCase);
         differences = [];
         hasData = board.Width > 0 && board.Height > 0;
@@ -178,7 +181,7 @@ public sealed class PanelView : UserControl
         group.Opacity = file.Role.StartsWith("Soldermask,", StringComparison.OrdinalIgnoreCase) ? 0.58 : 0.92;
         group.Freeze();
         return new Layer(file.Role, file.IsDrill, shapes, elements, color,
-            file.Text.Contains(".FilePolarity,Positive", StringComparison.OrdinalIgnoreCase), group);
+            CamEngine.GerberAttribute(file.Text, "FilePolarity") == "Positive", group);
     }
 
     private static Geometry ShapeGeometry(CamShape shape)
@@ -412,11 +415,19 @@ public sealed class PanelView : UserControl
         nextScene.Children.Add(new DirectionalLight(Color.FromRgb(145, 145, 145), new Vector3D(0.5, -0.4, 1)));
         if (hasData)
         {
+            var substrate = new StreamGeometry { FillRule = FillRule.EvenOdd };
+            using (var context = substrate.Open())
+                foreach (var contour in outline)
+                {
+                    context.BeginFigure(FromCam(contour[0]), isFilled: true, isClosed: true);
+                    context.PolyLineTo(contour.Skip(1).Select(FromCam).ToArray(), isStroked: true, isSmoothJoin: false);
+                }
+            substrate.Freeze();
             var holes = layers.Where(layer => layer.IsDrill).SelectMany(layer => layer.Shapes)
-                .Where(shape => ThroughHole(shape) && board.Contains(FromCam(shape.Points[0])))
+                .Where(shape => ThroughHole(shape) && substrate.FillContains(FromCam(shape.Points[0])))
                 .DistinctBy(shape => (shape.Points[0], shape.Width)).ToArray();
-            AddFace(nextScene, holes, top: true);
-            AddFace(nextScene, holes, top: false);
+            AddFace(nextScene, substrate, holes, top: true);
+            AddFace(nextScene, substrate, holes, top: false);
             AddWalls(nextScene, holes);
         }
         scene.Content = nextScene;
@@ -424,7 +435,7 @@ public sealed class PanelView : UserControl
         UpdateCamera();
     }
 
-    private void AddFace(Model3DGroup model, IReadOnlyList<CamShape> holes, bool top)
+    private void AddFace(Model3DGroup model, Geometry substrate, IReadOnlyList<CamShape> holes, bool top)
     {
         const double targetPixels = 1536;
         var pixelScale = targetPixels / Math.Max(board.Width, board.Height);
@@ -438,7 +449,7 @@ public sealed class PanelView : UserControl
             var holeGroup = new GeometryGroup { FillRule = FillRule.Nonzero };
             foreach (var hole in holes)
                 holeGroup.Children.Add(ShapeGeometry(hole));
-            drawing.PushClip(Combine(new RectangleGeometry(board), holeGroup, GeometryCombineMode.Exclude));
+            drawing.PushClip(Combine(substrate, holeGroup, GeometryCombineMode.Exclude));
             drawing.DrawRectangle(SurfaceColor, null, board);
             var side = top ? ",Top" : ",Bot";
             var sideLayers = VisibleLayers().Where(layer => layer.Role.EndsWith(side, StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -481,9 +492,9 @@ public sealed class PanelView : UserControl
     {
         var edgeMaterial = new DiffuseMaterial(BrushOf(136, 119, 77));
         var edges = new MeshGeometry3D();
-        Point[] exterior = [board.TopLeft, board.TopRight, board.BottomRight, board.BottomLeft];
-        for (var index = 0; index < exterior.Length; index++)
-            AddWall(edges, exterior[index], exterior[(index + 1) % exterior.Length]);
+        foreach (var contour in outline)
+            for (var index = 1; index < contour.Count; index++)
+                AddWall(edges, FromCam(contour[index - 1]), FromCam(contour[index]));
         model.Children.Add(new GeometryModel3D(edges, edgeMaterial) { BackMaterial = edgeMaterial });
 
         var boreMaterial = new DiffuseMaterial(BrushOf(76, 62, 45));

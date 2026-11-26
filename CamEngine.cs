@@ -72,7 +72,9 @@ public static class CamEngine
             var source = reader.ReadToEnd();
             var role = drill
                 ? Regex.Match(source, @"(?m)^;\s*#@!\s*TF\.FileFunction,([^\r\n]+)").Groups[1].Value.Trim()
-                : Regex.Match(source, @"%TF\.FileFunction,([^*]+)\*%").Groups[1].Value;
+                : GerberAttribute(source, "FileFunction");
+            if (!drill && role == "Drillmap")
+                return;
             var roleFromHeader = role;
             if (role.Length == 0 && !drill)
                 role = extension switch
@@ -117,15 +119,23 @@ public static class CamEngine
         var profiles = files.Where(file => file.Role.StartsWith("Profile", StringComparison.Ordinal)).ToArray();
         if (profiles.Length != 1)
             throw Bad("패널 또는 보드의 외곽 Gerber가 필요합니다.");
-        var bounds = RectangleBounds(Geometry(profiles[0]));
-        ValidateStack(files);
         var isPanel = files.Any(file => !file.IsDrill && file.Text.Contains("%TF.Part,Array*%", StringComparison.Ordinal));
+        var outline = Geometry(profiles[0]);
+        var bounds = isPanel ? RectangleBounds(outline) : PointBounds(OutlineContours(outline).SelectMany(path => path).ToArray());
+        ValidateStack(files);
         return new CamInput(Path.GetFullPath(path), files, bounds, isPanel);
     }
 
     public static bool ValidRole(string role, bool drill) => Regex.IsMatch(role, drill
         ? @"^(?:Plated,[1-9]\d?,[1-9]\d?,PTH|NonPlated,[1-9]\d?,[1-9]\d?,NPTH)$"
         : @"^(?:Copper,L[1-9]\d?,(?:Top|Bot|Inr)|(?:Soldermask|Paste|Legend),(?:Top|Bot)|Profile(?:,(?:P|NP))?|Vcut)$");
+
+    internal static string GerberAttribute(string source, string attribute)
+    {
+        var extended = Regex.Match(source, $@"%TF\.{attribute},([^*\r\n]+)\*%");
+        return extended.Success ? extended.Groups[1].Value
+            : Regex.Match(source, $@"(?m)^[ \t]*G04[ \t]+#@![ \t]+TF\.{attribute},([^*\r\n]+)\*").Groups[1].Value;
+    }
 
     public static CamPanel Build(CamInput input, PanelOptions options)
     {
@@ -147,7 +157,7 @@ public static class CamEngine
         if (input.Files.Any(file => file.Role.StartsWith("Profile,P", StringComparison.Ordinal)))
             throw Bad("도금된 외곽은 지원 대상에서 제외됩니다.");
 
-        var source = input.Bounds;
+        var source = RectangleBounds(Geometry(input.Files.Single(file => file.Role.StartsWith("Profile", StringComparison.Ordinal))));
         var boards = source with
         {
             MaxX = source.MinX + options.Columns * source.Width,
@@ -271,7 +281,7 @@ public static class CamEngine
     private static CamBounds RectangleBounds(IReadOnlyList<CamShape> geometry)
     {
         if (geometry.Count != 4 || geometry.Any(shape => shape.Kind != "Line" || !shape.Dark))
-            throw Bad("네 개의 직선으로 닫힌 직사각형 외곽만 지원합니다.");
+            throw Bad("V-cut 패널 생성에는 네 개의 직선으로 닫힌 직사각형 외곽이 필요합니다.");
         var points = geometry.SelectMany(shape => shape.Points).ToArray();
         var bounds = PointBounds(points);
         var corners = new HashSet<CamPoint> { new(bounds.MinX, bounds.MinY), new(bounds.MinX, bounds.MaxY),
@@ -286,6 +296,40 @@ public static class CamEngine
         if (edges != 4)
             throw Bad("외곽선에 중복 선이 있습니다.");
         return bounds;
+    }
+
+    internal static IReadOnlyList<IReadOnlyList<CamPoint>> OutlineContours(IReadOnlyList<CamShape> outline)
+    {
+        if (outline.Count == 0 || outline.Any(shape => shape.Kind is not ("Line" or "Arc") || !shape.Dark || shape.Points.Count < 2))
+            throw Bad("외곽 Gerber에는 닫힌 직선 또는 원호 경계가 필요합니다.");
+
+        // 플로터가 선분을 임의 순서와 방향으로 기록해도 끝점으로 외곽을 연결한다.
+        var atEndpoint = outline.SelectMany((shape, index) => new[] { (Point: shape.Points[0], Index: index),
+            (Point: shape.Points[^1], Index: index) }).ToLookup(endpoint => endpoint.Point, endpoint => endpoint.Index);
+        if (atEndpoint.Any(endpoint => endpoint.Count() != 2))
+            throw Bad("외곽 Gerber에 끊어졌거나 겹치는 경계가 있습니다.");
+
+        var used = new HashSet<int>();
+        var contours = new List<IReadOnlyList<CamPoint>>();
+        for (var index = 0; index < outline.Count; index++)
+        {
+            if (!used.Add(index))
+                continue;
+            var contour = outline[index].Points.ToList();
+            while (contour[0] != contour[^1])
+            {
+                var next = atEndpoint[contour[^1]].FirstOrDefault(edge => !used.Contains(edge), -1);
+                if (next == -1)
+                    throw Bad("외곽 Gerber의 경계를 닫을 수 없습니다.");
+                used.Add(next);
+                var points = outline[next].Points;
+                contour.AddRange((points[0] == contour[^1] ? points : points.Reverse()).Skip(1));
+            }
+            if (contour.Take(contour.Count - 1).Distinct().Count() < 3)
+                throw Bad("외곽 Gerber의 닫힌 경계가 면을 이루지 않습니다.");
+            contours.Add(contour);
+        }
+        return contours;
     }
 
     private static List<CamLine> Cuts(CamBounds source, CamBounds boards, CamBounds panel, PanelOptions options)
@@ -830,12 +874,17 @@ public static class CamEngine
         output.AppendLine("%TF.GenerationSoftware,GerberHandler,GerberHandler*%");
         output.AppendLine("%TF.Part,Array*%");
         output.AppendLine($"%TF.FileFunction,{file.Role}*%");
+        var polarity = GerberAttribute(file.Text, "FilePolarity");
+        if (polarity is "Positive" or "Negative")
+            output.AppendLine($"%TF.FilePolarity,{polarity}*%");
         commands.RemoveAll(command => command.StartsWith("%TF.Part,", StringComparison.Ordinal) ||
             command.StartsWith("%TF.ProjectId,", StringComparison.Ordinal) ||
             command.StartsWith("%TF.CreationDate,", StringComparison.Ordinal) ||
             command.StartsWith("%TF.GenerationSoftware,", StringComparison.Ordinal) ||
             command.StartsWith("%TF.FileFunction,", StringComparison.Ordinal) ||
+            command.StartsWith("%TF.FilePolarity,", StringComparison.Ordinal) ||
             command.StartsWith("%TF.MD5,", StringComparison.Ordinal) ||
+            Regex.IsMatch(command, @"^G04[ \t]+#@![ \t]+TF\.(Part|ProjectId|CreationDate|GenerationSoftware|FileFunction|FilePolarity|MD5),") ||
             command == "M02*");
         var format = commands.Select(command => GerberFormat.Match(command)).First(match => match.Success);
         var wholeX = int.Parse(format.Groups[1].Value, Invariant);
@@ -852,7 +901,7 @@ public static class CamEngine
             .Select(match => int.Parse(match.Groups[1].Value, Invariant)).DefaultIfEmpty(9).Max() + 1;
         var topCopper = file.Role == "Copper,L1,Top";
         var topMask = file.Role == "Soldermask,Top";
-        if (marks.Count > 0 && topMask && !commands.Contains("%TF.FilePolarity,Negative*%"))
+        if (marks.Count > 0 && topMask && polarity != "Negative")
             throw Bad($"{file.Name}: 피두셜 개구를 추가하려면 음극성 상면 솔더마스크가 필요합니다.");
 
         foreach (var command in commands.Take(split))

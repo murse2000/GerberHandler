@@ -1,0 +1,8 @@
+bin/
+obj/
+.vs/
+.tools/
+artifacts/
+Releases/
+*.user
+*.suo

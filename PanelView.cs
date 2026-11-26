@@ -1,0 +1,613 @@
+using System.Globalization;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Media.Media3D;
+
+namespace GerberHandler;
+
+public sealed class PanelView : UserControl
+{
+    private static readonly Brush CanvasColor = BrushOf(18, 25, 32);
+    private static readonly Brush BoardColor = BrushOf(26, 46, 48);
+    private static readonly Brush SurfaceColor = BrushOf(28, 94, 74);
+    private static readonly Brush CopperColor = BrushOf(219, 164, 77);
+    private static readonly Brush ProfileColor = BrushOf(160, 193, 205);
+    private static readonly Brush CutColor = BrushOf(239, 170, 94);
+    private static readonly Brush TextColor = BrushOf(219, 230, 237);
+    private readonly CanvasSurface canvas;
+    private readonly Viewport3D viewport = new();
+    private readonly OrthographicCamera camera = new();
+    private readonly ModelVisual3D scene = new();
+    private readonly TabControl tabs = new();
+    private readonly TextBlock measuringResult = new() { Margin = new Thickness(8, 2, 0, 0), Foreground = TextColor };
+    private readonly TextBox thicknessField = new() { Width = 64, Text = "1.60" };
+    private readonly TextBlock thicknessError = new() { Margin = new Thickness(8, 2, 0, 0), Foreground = TextColor };
+    private readonly System.Windows.Controls.Primitives.ToggleButton measure = new() { Content = "거리 측정", Margin = new Thickness(3, 0, 3, 0) };
+    private IReadOnlyList<Layer> layers = [];
+    private IReadOnlyList<(Geometry Geometry, Brush Brush)> differences = [];
+    private HashSet<string> visible = new(StringComparer.OrdinalIgnoreCase);
+    private Rect board;
+    private double zoomFactor = 1;
+    private Vector pan;
+    private Point? dragStart;
+    private Vector dragOffset;
+    private Point? measureStart;
+    private Point? measureEnd;
+    private bool hasData;
+    private bool sceneDirty;
+    private double boardThickness = 1.6;
+    private double azimuth = -75;
+    private double elevation = 50;
+    private double orbitZoom = 1;
+
+    public PanelView()
+    {
+        canvas = new CanvasSurface(DrawPlan) { ClipToBounds = true };
+        var planPage = CreatePage(canvas, Button("전체 보기", FitPlan), measure, measuringResult);
+        viewport.ClipToBounds = true;
+        viewport.Camera = camera;
+        viewport.Children.Add(scene);
+        var orbitPage = CreatePage(viewport,
+            Button("위에서 보기", () => SetOrbit(-90, 89.9)),
+            Button("아래에서 보기", () => SetOrbit(-90, -89.9)),
+            Button("사선 보기", () => SetOrbit(-75, 50)),
+            new TextBlock { Text = "표시 두께(mm)", Margin = new Thickness(10, 2, 6, 0), Foreground = TextColor },
+            thicknessField, thicknessError);
+        tabs.Items.Add(new TabItem { Header = "2D 레이어", Content = planPage });
+        tabs.Items.Add(new TabItem { Header = "3D 패널", Content = orbitPage });
+        tabs.SelectionChanged += (_, _) => RefreshSceneIfVisible();
+        Content = tabs;
+
+        canvas.MouseWheel += ZoomPlan;
+        canvas.MouseLeftButtonDown += BeginPlanGesture;
+        canvas.MouseLeftButtonUp += (_, _) => { dragStart = null; canvas.ReleaseMouseCapture(); };
+        canvas.MouseMove += MovePlanGesture;
+        measure.Unchecked += (_, _) => ClearMeasurement();
+        thicknessField.LostKeyboardFocus += (_, _) => CommitThickness();
+        thicknessField.KeyDown += (_, e) => { if (e.Key == Key.Enter) CommitThickness(); };
+        viewport.MouseLeftButtonDown += (_, e) => { dragStart = e.GetPosition(viewport); viewport.CaptureMouse(); };
+        viewport.MouseLeftButtonUp += (_, _) => { dragStart = null; viewport.ReleaseMouseCapture(); };
+        viewport.MouseMove += RotateScene;
+        viewport.MouseWheel += (_, e) =>
+        {
+            orbitZoom = Math.Clamp(orbitZoom * Math.Pow(1.12, e.Delta / 120.0), 0.5, 30);
+            UpdateCamera();
+            e.Handled = true;
+        };
+        viewport.SizeChanged += (_, _) => UpdateCamera();
+    }
+
+    public void SetData(IReadOnlyList<CamFile> files, CamBounds bounds)
+    {
+        var nextBoard = new Rect((double)bounds.MinX, -(double)bounds.MaxY, (double)bounds.Width, (double)bounds.Height);
+        var nextLayers = files.Select(file => BuildLayer(file, nextBoard)).ToArray();
+        var sameBoard = hasData && board == nextBoard;
+        board = nextBoard;
+        layers = nextLayers;
+        visible = files.Select(file => file.Role).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        differences = [];
+        hasData = board.Width > 0 && board.Height > 0;
+        measureStart = null;
+        measureEnd = null;
+        measuringResult.Text = "";
+        if (!sameBoard)
+        {
+            FitPlan();
+            orbitZoom = 1;
+        }
+        InvalidateViews();
+    }
+
+    public void SetVisibleRoles(IEnumerable<string> roles)
+    {
+        visible = roles.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        InvalidateViews();
+    }
+
+    public void SetThickness(decimal thickness)
+    {
+        if (thickness <= 0)
+            throw new ArgumentOutOfRangeException(nameof(thickness));
+        boardThickness = (double)thickness;
+        thicknessField.Text = thickness.ToString("0.###", CultureInfo.InvariantCulture);
+        thicknessError.Text = "";
+        InvalidateViews();
+    }
+
+    public void Focus(CamPoint point)
+    {
+        if (!hasData)
+            return;
+        tabs.SelectedIndex = 0;
+        zoomFactor = Math.Max(zoomFactor, 4);
+        pan = (Center(board) - FromCam(point)) * PlanScale;
+        canvas.InvalidateVisual();
+    }
+
+    public void ShowComparison(IReadOnlyList<CamShape> missing, IReadOnlyList<CamShape> added)
+    {
+        var missingBrush = BrushOf(255, 101, 134);
+        var addedBrush = BrushOf(100, 242, 226);
+        differences = missing.Select(shape => (ShapeGeometry(shape), missingBrush))
+            .Concat(added.Select(shape => (ShapeGeometry(shape), addedBrush))).ToArray();
+        if (differences.Count > 0)
+            tabs.SelectedIndex = 0;
+        canvas.InvalidateVisual();
+    }
+
+    private static UIElement CreatePage(UIElement view, params UIElement[] tools)
+    {
+        var page = new DockPanel { Background = CanvasColor };
+        var bar = new WrapPanel { Margin = new Thickness(8, 6, 8, 6) };
+        foreach (var tool in tools)
+            bar.Children.Add(tool);
+        DockPanel.SetDock(bar, Dock.Top);
+        page.Children.Add(bar);
+        page.Children.Add(view);
+        return page;
+    }
+
+    private static Button Button(string caption, Action action)
+    {
+        var button = new Button { Content = caption, Margin = new Thickness(3, 0, 3, 0), Padding = new Thickness(7, 2, 7, 2) };
+        button.Click += (_, _) => action();
+        return button;
+    }
+
+    private static Layer BuildLayer(CamFile file, Rect extent)
+    {
+        var shapes = CamEngine.Geometry(file);
+        var elements = shapes.Select(shape => (Shape: shape, Geometry: ShapeGeometry(shape))).ToArray();
+        var color = file.Role.Split(',')[0] switch
+        {
+            "Copper" => file.Role.EndsWith(",Bot", StringComparison.OrdinalIgnoreCase) ? BrushOf(104, 171, 236) : CopperColor,
+            "Soldermask" => BrushOf(104, 213, 142),
+            "Legend" => BrushOf(236, 233, 213),
+            "Paste" => BrushOf(205, 205, 219),
+            "Profile" => ProfileColor,
+            "Vcut" => CutColor,
+            "Plated" or "NonPlated" => BrushOf(133, 226, 230),
+            _ => ProfileColor
+        };
+        var group = new DrawingGroup();
+        using (var drawing = group.Open())
+            DrawLayer(drawing, elements, color, extent);
+        group.Opacity = file.Role.StartsWith("Soldermask,", StringComparison.OrdinalIgnoreCase) ? 0.58 : 0.92;
+        group.Freeze();
+        return new Layer(file.Role, file.IsDrill, shapes, elements, color,
+            file.Text.Contains(".FilePolarity,Positive", StringComparison.OrdinalIgnoreCase), group);
+    }
+
+    private static Geometry ShapeGeometry(CamShape shape)
+    {
+        Geometry result;
+        if (shape.Contours is { Count: > 0 })
+        {
+            var contours = new StreamGeometry { FillRule = FillRule.EvenOdd };
+            using (var writer = contours.Open())
+            {
+                foreach (var contour in shape.Contours.Where(contour => contour.Count > 2))
+                {
+                    writer.BeginFigure(FromCam(contour[0]), true, true);
+                    writer.PolyLineTo(contour.Skip(1).Select(FromCam).ToList(), true, false);
+                }
+            }
+            result = contours;
+        }
+        else if (shape.Points.Count == 0)
+        {
+            return Geometry.Empty;
+        }
+        else if (shape.Kind is "Flash" or "Drill")
+        {
+            var center = FromCam(shape.Points[0]);
+            var width = shape.Width > 0 ? (double)shape.Width : 0.01;
+            var height = shape.Height > 0 ? (double)shape.Height : width;
+            result = shape.IsCircular || shape.Kind == "Drill"
+                ? new EllipseGeometry(center, width / 2, shape.Kind == "Drill" ? width / 2 : height / 2)
+                : new RectangleGeometry(new Rect(center.X - width / 2, center.Y - height / 2, width, height));
+        }
+        else
+        {
+            var path = new StreamGeometry();
+            using (var writer = path.Open())
+            {
+                var region = shape.Kind == "Region";
+                writer.BeginFigure(FromCam(shape.Points[0]), region, region);
+                writer.PolyLineTo(shape.Points.Skip(1).Select(FromCam).ToList(), true, false);
+            }
+            if (shape.Kind == "Region")
+            {
+                result = path;
+            }
+            else
+            {
+                var radiusWidth = shape.Width > 0 ? (double)shape.Width : 0.02;
+                if (shape.Points.All(point => point == shape.Points[0]))
+                {
+                    result = new EllipseGeometry(FromCam(shape.Points[0]), radiusWidth / 2, radiusWidth / 2);
+                }
+                else
+                {
+                    var pen = new Pen(Brushes.White, radiusWidth) { StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round, LineJoin = PenLineJoin.Round };
+                    result = path.GetWidenedPathGeometry(pen, 0.0001, ToleranceType.Absolute);
+                }
+            }
+        }
+        result.Freeze();
+        return result;
+    }
+
+    private void InvalidateViews()
+    {
+        sceneDirty = true;
+        canvas.InvalidateVisual();
+        RefreshSceneIfVisible();
+    }
+
+    private double PlanScale => hasData
+        ? Math.Max(0.0001, Math.Min((canvas.ActualWidth - 56) / board.Width, (canvas.ActualHeight - 64) / board.Height)) * zoomFactor
+        : 1;
+
+    private Point PlanCenter => new(canvas.ActualWidth / 2 + pan.X, canvas.ActualHeight / 2 + pan.Y);
+
+    private void FitPlan()
+    {
+        zoomFactor = 1;
+        pan = default;
+        canvas.InvalidateVisual();
+    }
+
+    private void DrawPlan(DrawingContext drawing)
+    {
+        drawing.DrawRectangle(CanvasColor, null, new Rect(canvas.RenderSize));
+        if (!hasData)
+        {
+            DrawText(drawing, "Gerber ZIP 또는 폴더를 열어 패널을 확인하세요.", new Point(24, 27));
+            return;
+        }
+
+        var view = new Matrix(PlanScale, 0, 0, PlanScale,
+            PlanCenter.X - Center(board).X * PlanScale, PlanCenter.Y - Center(board).Y * PlanScale);
+        drawing.PushTransform(new MatrixTransform(view));
+        drawing.DrawRectangle(BoardColor, null, board);
+        foreach (var layer in VisibleLayers().OrderBy(LayerOrder))
+            drawing.DrawDrawing(layer.PlanDrawing);
+        foreach (var (shape, brush) in differences)
+            drawing.DrawGeometry(brush, new Pen(brush, 1.5 / PlanScale), shape);
+        drawing.Pop();
+
+        DrawText(drawing, FormattableString.Invariant($"{board.Width:0.###} × {board.Height:0.###} mm"), new Point(12, Math.Max(2, canvas.ActualHeight - 25)));
+        if (measureStart is { } start && measureEnd is { } end)
+        {
+            var from = view.Transform(start);
+            var to = view.Transform(end);
+            var stroke = new Pen(Brushes.White, 1.4);
+            drawing.DrawLine(stroke, from, to);
+            drawing.DrawEllipse(Brushes.White, null, from, 3, 3);
+            drawing.DrawEllipse(Brushes.White, null, to, 3, 3);
+        }
+    }
+
+    private void DrawText(DrawingContext drawing, string caption, Point point)
+    {
+        var text = new FormattedText(caption, CultureInfo.CurrentCulture, FlowDirection.LeftToRight,
+            new Typeface("Malgun Gothic"), 13, TextColor, VisualTreeHelper.GetDpi(canvas).PixelsPerDip);
+        drawing.DrawText(text, point);
+    }
+
+    private IEnumerable<Layer> VisibleLayers() => layers.Where(layer => visible.Contains(layer.Role));
+
+    private static int LayerOrder(Layer layer) => layer.Role.Split(',')[0] switch
+    {
+        "Copper" => 0,
+        "Soldermask" => 1,
+        "Paste" => 2,
+        "Legend" => 3,
+        "Profile" => 4,
+        "Vcut" => 5,
+        _ => 6
+    };
+
+    private static void DrawLayer(DrawingContext drawing, (CamShape Shape, Geometry Geometry)[] elements, Brush brush, Rect extent)
+    {
+        // 하나의 파일에서 나중에 그리는 clear 객체만 앞의 dark 객체에 영향을 준다.
+        var pushes = 0;
+        for (var index = elements.Length - 1; index >= 0; index--)
+        {
+            var (shape, geometry) = elements[index];
+            if (shape.Dark)
+                drawing.DrawGeometry(brush, null, geometry);
+            else
+            {
+                var end = index + 1;
+                while (index > 0 && !elements[index - 1].Shape.Dark)
+                    index--;
+                var clip = Combine(new RectangleGeometry(extent), MergeRange(elements, index, end), GeometryCombineMode.Exclude);
+                drawing.PushClip(clip);
+                pushes++;
+            }
+        }
+        while (pushes-- > 0)
+            drawing.Pop();
+    }
+
+    private void ZoomPlan(object sender, MouseWheelEventArgs e)
+    {
+        if (!hasData)
+            return;
+        var cursor = e.GetPosition(canvas);
+        var previous = PlanScale;
+        zoomFactor = Math.Clamp(zoomFactor * Math.Pow(1.16, e.Delta / 120.0), 0.4, 75);
+        pan += (cursor - PlanCenter) * (1 - PlanScale / previous);
+        canvas.InvalidateVisual();
+        e.Handled = true;
+    }
+
+    private void BeginPlanGesture(object sender, MouseButtonEventArgs e)
+    {
+        if (!hasData)
+            return;
+        var cursor = e.GetPosition(canvas);
+        if (measure.IsChecked == true)
+        {
+            var point = Center(board) + (cursor - PlanCenter) / PlanScale;
+            if (measureStart is null || measureEnd is not null)
+            {
+                measureStart = point;
+                measureEnd = null;
+                measuringResult.Text = "두 번째 점 선택";
+            }
+            else
+            {
+                measureEnd = point;
+                measuringResult.Text = FormattableString.Invariant($"{(point - measureStart.Value).Length:0.###} mm");
+            }
+            canvas.InvalidateVisual();
+            return;
+        }
+        dragStart = cursor;
+        dragOffset = pan;
+        canvas.CaptureMouse();
+    }
+
+    private void MovePlanGesture(object sender, MouseEventArgs e)
+    {
+        if (dragStart is not { } start || e.LeftButton != MouseButtonState.Pressed)
+            return;
+        pan = dragOffset + (e.GetPosition(canvas) - start);
+        canvas.InvalidateVisual();
+    }
+
+    private void ClearMeasurement()
+    {
+        measureStart = null;
+        measureEnd = null;
+        measuringResult.Text = "";
+        canvas.InvalidateVisual();
+    }
+
+    private void CommitThickness()
+    {
+        if (!decimal.TryParse(thicknessField.Text, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var value) || value <= 0)
+        {
+            thicknessError.Text = "0보다 큰 두께를 입력하세요.";
+            return;
+        }
+        if ((double)value != boardThickness)
+            SetThickness(value);
+        thicknessError.Text = "";
+    }
+
+    private void RefreshSceneIfVisible()
+    {
+        if (!sceneDirty || tabs.SelectedIndex != 1)
+            return;
+        var nextScene = new Model3DGroup();
+        nextScene.Children.Add(new AmbientLight(Color.FromRgb(112, 112, 112)));
+        nextScene.Children.Add(new DirectionalLight(Color.FromRgb(190, 190, 190), new Vector3D(-0.2, 0.4, -1)));
+        nextScene.Children.Add(new DirectionalLight(Color.FromRgb(145, 145, 145), new Vector3D(0.5, -0.4, 1)));
+        if (hasData)
+        {
+            var holes = layers.Where(layer => layer.IsDrill).SelectMany(layer => layer.Shapes)
+                .Where(shape => ThroughHole(shape) && board.Contains(FromCam(shape.Points[0])))
+                .DistinctBy(shape => (shape.Points[0], shape.Width)).ToArray();
+            AddFace(nextScene, holes, top: true);
+            AddFace(nextScene, holes, top: false);
+            AddWalls(nextScene, holes);
+        }
+        scene.Content = nextScene;
+        sceneDirty = false;
+        UpdateCamera();
+    }
+
+    private void AddFace(Model3DGroup model, IReadOnlyList<CamShape> holes, bool top)
+    {
+        const double targetPixels = 1536;
+        var pixelScale = targetPixels / Math.Max(board.Width, board.Height);
+        var pixelWidth = Math.Max(1, (int)Math.Ceiling(board.Width * pixelScale));
+        var pixelHeight = Math.Max(1, (int)Math.Ceiling(board.Height * pixelScale));
+        var surface = new DrawingVisual();
+        using (var drawing = surface.RenderOpen())
+        {
+            drawing.PushTransform(new MatrixTransform(pixelWidth / board.Width, 0, 0, pixelHeight / board.Height,
+                -board.X * pixelWidth / board.Width, -board.Y * pixelHeight / board.Height));
+            var holeGroup = new GeometryGroup { FillRule = FillRule.Nonzero };
+            foreach (var hole in holes)
+                holeGroup.Children.Add(ShapeGeometry(hole));
+            drawing.PushClip(Combine(new RectangleGeometry(board), holeGroup, GeometryCombineMode.Exclude));
+            drawing.DrawRectangle(SurfaceColor, null, board);
+            var side = top ? ",Top" : ",Bot";
+            var sideLayers = VisibleLayers().Where(layer => layer.Role.EndsWith(side, StringComparison.OrdinalIgnoreCase)).ToArray();
+            var mask = sideLayers.FirstOrDefault(layer => layer.Role.StartsWith("Soldermask,", StringComparison.OrdinalIgnoreCase));
+            if (mask is not null)
+            {
+                var maskGeometry = LayerArea(mask);
+                var openings = mask.Positive ? Combine(new RectangleGeometry(board), maskGeometry, GeometryCombineMode.Exclude) : maskGeometry;
+                drawing.PushClip(openings);
+            }
+            foreach (var copper in sideLayers.Where(layer => layer.Role.StartsWith("Copper,", StringComparison.OrdinalIgnoreCase)))
+                DrawLayer(drawing, copper.Elements, CopperColor, board);
+            if (mask is not null)
+                drawing.Pop();
+            foreach (var legend in sideLayers.Where(layer => layer.Role.StartsWith("Legend,", StringComparison.OrdinalIgnoreCase)))
+                DrawLayer(drawing, legend.Elements, legend.Color, board);
+            foreach (var cut in VisibleLayers().Where(layer => layer.Role.StartsWith("Vcut", StringComparison.OrdinalIgnoreCase)))
+                foreach (var shape in cut.Shapes.Where(shape => shape.Points.Count > 1))
+                    drawing.DrawLine(new Pen(CutColor, Math.Max(0.12, 2 / pixelScale)), FromCam(shape.Points[0]), FromCam(shape.Points[^1]));
+            drawing.Pop();
+            drawing.Pop();
+        }
+        var image = new RenderTargetBitmap(pixelWidth, pixelHeight, 96, 96, PixelFormats.Pbgra32);
+        image.Render(surface);
+        image.Freeze();
+        var material = new DiffuseMaterial(new ImageBrush(image) { Stretch = Stretch.Fill });
+        var z = top ? boardThickness / 2 : -boardThickness / 2;
+        var mesh = new MeshGeometry3D
+        {
+            Positions = new Point3DCollection { ToModel(board.TopLeft, z), ToModel(board.BottomLeft, z), ToModel(board.BottomRight, z), ToModel(board.TopRight, z) },
+            TextureCoordinates = new PointCollection { new(0, 0), new(0, 1), new(1, 1), new(1, 0) },
+            TriangleIndices = top ? new Int32Collection { 0, 1, 2, 0, 2, 3 } : new Int32Collection { 0, 2, 1, 0, 3, 2 }
+        };
+        model.Children.Add(new GeometryModel3D(mesh, material));
+    }
+
+    private static bool ThroughHole(CamShape shape) => shape.Kind == "Drill" && shape.Points.Count == 1 && shape.Width > 0;
+
+    private void AddWalls(Model3DGroup model, IReadOnlyList<CamShape> holes)
+    {
+        var edgeMaterial = new DiffuseMaterial(BrushOf(136, 119, 77));
+        var edges = new MeshGeometry3D();
+        Point[] exterior = [board.TopLeft, board.TopRight, board.BottomRight, board.BottomLeft];
+        for (var index = 0; index < exterior.Length; index++)
+            AddWall(edges, exterior[index], exterior[(index + 1) % exterior.Length]);
+        model.Children.Add(new GeometryModel3D(edges, edgeMaterial) { BackMaterial = edgeMaterial });
+
+        var boreMaterial = new DiffuseMaterial(BrushOf(76, 62, 45));
+        foreach (var batch in holes.Chunk(128))
+        {
+            var bores = new MeshGeometry3D();
+            foreach (var hole in batch)
+            {
+                var center = FromCam(hole.Points[0]);
+                var radius = (double)hole.Width / 2;
+                const int sides = 24;
+                for (var index = 0; index < sides; index++)
+                {
+                    var from = index * Math.Tau / sides;
+                    var to = (index + 1) * Math.Tau / sides;
+                    AddWall(bores, center + new Vector(radius * Math.Cos(from), radius * Math.Sin(from)),
+                        center + new Vector(radius * Math.Cos(to), radius * Math.Sin(to)));
+                }
+            }
+            model.Children.Add(new GeometryModel3D(bores, boreMaterial) { BackMaterial = boreMaterial });
+        }
+    }
+
+    private void AddWall(MeshGeometry3D mesh, Point from, Point to)
+    {
+        var index = mesh.Positions.Count;
+        var z = boardThickness / 2;
+        mesh.Positions.Add(ToModel(from, z));
+        mesh.Positions.Add(ToModel(from, -z));
+        mesh.Positions.Add(ToModel(to, -z));
+        mesh.Positions.Add(ToModel(to, z));
+        mesh.TriangleIndices.Add(index);
+        mesh.TriangleIndices.Add(index + 1);
+        mesh.TriangleIndices.Add(index + 2);
+        mesh.TriangleIndices.Add(index);
+        mesh.TriangleIndices.Add(index + 2);
+        mesh.TriangleIndices.Add(index + 3);
+    }
+
+    private Point3D ToModel(Point point, double z)
+    {
+        var center = Center(board);
+        return new Point3D(point.X - center.X, center.Y - point.Y, z);
+    }
+
+    private static Geometry LayerArea(Layer layer)
+    {
+        // 균형 있게 병합해 마스크의 많은 독립 개구를 한 번씩 누적하는 비용을 줄인다.
+        var area = Geometry.Empty;
+        var index = 0;
+        while (index < layer.Elements.Length)
+        {
+            var from = index;
+            var dark = layer.Elements[from].Shape.Dark;
+            while (index < layer.Elements.Length && layer.Elements[index].Shape.Dark == dark)
+                index++;
+            var run = MergeRange(layer.Elements, from, index);
+            area = Combine(area, run, dark ? GeometryCombineMode.Union : GeometryCombineMode.Exclude);
+        }
+        return area;
+    }
+
+    private static Geometry MergeRange((CamShape Shape, Geometry Geometry)[] elements, int start, int end)
+    {
+        if (end - start == 1)
+            return elements[start].Geometry;
+        var middle = start + (end - start) / 2;
+        return Combine(MergeRange(elements, start, middle), MergeRange(elements, middle, end), GeometryCombineMode.Union);
+    }
+
+    private static Geometry Combine(Geometry first, Geometry second, GeometryCombineMode mode) =>
+        Geometry.Combine(first, second, mode, null, 0.0001, ToleranceType.Absolute);
+
+    private void SetOrbit(double angle, double tilt)
+    {
+        azimuth = angle;
+        elevation = tilt;
+        orbitZoom = 1;
+        UpdateCamera();
+    }
+
+    private void RotateScene(object sender, MouseEventArgs e)
+    {
+        if (dragStart is not { } start || e.LeftButton != MouseButtonState.Pressed)
+            return;
+        var point = e.GetPosition(viewport);
+        var delta = point - start;
+        azimuth -= delta.X * 0.6;
+        elevation = Math.Clamp(elevation + delta.Y * 0.6, -89.9, 89.9);
+        dragStart = point;
+        UpdateCamera();
+    }
+
+    private void UpdateCamera()
+    {
+        if (!hasData)
+            return;
+        var angle = azimuth * Math.PI / 180;
+        var tilt = elevation * Math.PI / 180;
+        var distance = Math.Max(board.Width, board.Height) * 3 + boardThickness;
+        var location = new Vector3D(Math.Cos(tilt) * Math.Cos(angle), Math.Cos(tilt) * Math.Sin(angle), Math.Sin(tilt)) * distance;
+        camera.Position = new Point3D(location.X, location.Y, location.Z);
+        camera.LookDirection = -location;
+        camera.UpDirection = new Vector3D(0, 0, 1);
+        var ratio = viewport.ActualHeight > 0 ? Math.Max(1, viewport.ActualWidth / viewport.ActualHeight) : 1;
+        camera.Width = Math.Sqrt(board.Width * board.Width + board.Height * board.Height) * 1.12 * ratio / orbitZoom;
+    }
+
+    private static Point FromCam(CamPoint point) => new((double)point.X, -(double)point.Y);
+
+    private static Point Center(Rect rect) => new(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
+
+    private static Brush BrushOf(byte red, byte green, byte blue)
+    {
+        var brush = new SolidColorBrush(Color.FromRgb(red, green, blue));
+        brush.Freeze();
+        return brush;
+    }
+
+    private sealed record Layer(string Role, bool IsDrill, IReadOnlyList<CamShape> Shapes,
+        (CamShape Shape, Geometry Geometry)[] Elements, Brush Color, bool Positive, DrawingGroup PlanDrawing);
+
+    private sealed class CanvasSurface(Action<DrawingContext> render) : FrameworkElement
+    {
+        protected override void OnRender(DrawingContext drawingContext) => render(drawingContext);
+    }
+}

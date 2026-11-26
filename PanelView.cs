@@ -44,6 +44,11 @@ public sealed class PanelView : UserControl
     private int draggedFiducial = -1;
     private CamPoint? dragTarget;
     internal event Action<IReadOnlyList<CamPoint>>? FiducialsMoved;
+    private IReadOnlyList<MixedBoard> editableBoards = [];
+    private int selectedBoard = -1;
+    private int draggedBoard = -1;
+    internal event Action<int>? BoardSelected;
+    internal event Action<int, CamPoint>? BoardMoved;
     private Point? measureStart;
     private Point? measureEnd;
     private bool hasData;
@@ -95,6 +100,36 @@ public sealed class PanelView : UserControl
 
     internal void SetPanel(IReadOnlyList<CamFile> files, CamBounds panel, CamBounds source, CamBounds boards, PanelOptions options) =>
         SetData(files, panel, LayoutFillAreas(source, boards, panel, options));
+
+    internal void SetMixedOutput(IReadOnlyList<CamFile> files, CamBounds panel, CamBounds boards, PanelOptions options) =>
+        SetData(files, panel, LayoutFillAreas(boards, boards, panel, options with { Rows = 1, Columns = 1, FillGaps = false }));
+
+    internal void SetMixedLayout(IReadOnlyList<MixedBoard> boards, CamBounds content, CamBounds panel, PanelOptions options,
+        IReadOnlyList<CamPoint> fiducials)
+    {
+        var frame = LayoutFillAreas(content, content, panel, options with { Rows = 1, Columns = 1, FillGaps = false });
+        var contours = new List<IReadOnlyList<CamPoint>>();
+        var geometry = new Dictionary<string, (CamFile File, List<CamShape> Shapes)>();
+        foreach (var board in boards)
+            foreach (var file in board.Input.Files)
+            {
+                var source = CamEngine.Geometry(file);
+                var translated = source.Select(shape => CamEngine.Translate(shape, board.Offset.X, board.Offset.Y)).ToArray();
+                if (file.Role.StartsWith("Profile", StringComparison.Ordinal))
+                    contours.AddRange(CamEngine.OutlineContours(translated));
+                if (!geometry.TryGetValue(file.Role, out var layer))
+                    geometry.Add(file.Role, layer = (file, []));
+                layer.Shapes.AddRange(translated);
+            }
+        contours.AddRange(frame.Select(RectangleContour));
+        if (geometry.TryGetValue("Copper,L1,Top", out var copper))
+            copper.Shapes.AddRange(fiducials.Select(point => new CamShape("Flash", [point], options.FiducialDiameter,
+                options.FiducialDiameter, true, true, true)));
+        if (geometry.TryGetValue("Soldermask,Top", out var mask) && CamEngine.GerberAttribute(mask.File.Text, "FilePolarity") == "Negative")
+            mask.Shapes.AddRange(fiducials.Select(point => new CamShape("Flash", [point], options.MaskDiameter, options.MaskDiameter, true, true)));
+        var extent = ToRect(panel);
+        ApplyData(extent, geometry.Values.Select(layer => BuildLayer(layer.File, layer.Shapes, extent)).ToArray(), contours, frame);
+    }
 
     private void SetData(IReadOnlyList<CamFile> files, CamBounds bounds, IReadOnlyList<CamBounds> fills)
     {
@@ -178,6 +213,8 @@ public sealed class PanelView : UserControl
         layers = nextLayers;
         outline = nextOutline;
         editableFiducials = [];
+        editableBoards = [];
+        selectedBoard = -1;
         ClearPlanDrag();
         guideAreas = fills.Select(ToRect).ToArray();
         var materialOutline = new StreamGeometry { FillRule = FillRule.EvenOdd };
@@ -206,6 +243,18 @@ public sealed class PanelView : UserControl
     internal void SetEditableFiducials(IReadOnlyList<CamPoint> points)
     {
         editableFiducials = points;
+        canvas.InvalidateVisual();
+    }
+
+    internal void SetEditableBoards(IReadOnlyList<MixedBoard> boards, int selection)
+    {
+        editableBoards = boards;
+        SelectBoard(selection);
+    }
+
+    internal void SelectBoard(int selection)
+    {
+        selectedBoard = selection;
         canvas.InvalidateVisual();
     }
 
@@ -418,6 +467,14 @@ public sealed class PanelView : UserControl
             drawing.DrawGeometry(brush, new Pen(brush, 1.5 / PlanScale), shape);
         drawing.Pop();
 
+        if (selectedBoard >= 0 && selectedBoard < editableBoards.Count)
+        {
+            var selected = editableBoards[selectedBoard];
+            var bounds = ToRect((dragTarget is { } target && draggedBoard == selectedBoard ? selected with { Origin = target } : selected).Bounds);
+            var outlinePen = new Pen(FiducialColor, 1.5) { DashStyle = DashStyles.Dash };
+            drawing.DrawRectangle(null, outlinePen, Rect.Transform(bounds, view));
+        }
+
         if (visible.Contains("Copper,L1,Top"))
             for (var index = 0; index < editableFiducials.Count; index++)
             {
@@ -521,6 +578,11 @@ public sealed class PanelView : UserControl
         dragOffset = pan;
         draggedFiducial = FindFiducial(cursor);
         dragTarget = draggedFiducial >= 0 ? editableFiducials[draggedFiducial] : null;
+        if (draggedFiducial < 0 && editableBoards.Count > 0)
+        {
+            draggedBoard = FindBoard(cursor);
+            BoardSelected?.Invoke(draggedBoard);
+        }
         canvas.CaptureMouse();
     }
 
@@ -529,11 +591,13 @@ public sealed class PanelView : UserControl
         var cursor = e.GetPosition(canvas);
         if (dragStart is not { } start || e.LeftButton != MouseButtonState.Pressed)
         {
-            canvas.Cursor = measure.IsChecked != true && FindFiducial(cursor) >= 0 ? Cursors.SizeAll : Cursors.Arrow;
+            canvas.Cursor = measure.IsChecked != true && (FindFiducial(cursor) >= 0 || FindBoard(cursor) >= 0) ? Cursors.SizeAll : Cursors.Arrow;
             return;
         }
         if (draggedFiducial >= 0)
             dragTarget = SnapFiducial(editableFiducials[draggedFiducial], cursor - start, PlanScale);
+        else if (draggedBoard >= 0)
+            dragTarget = SnapBoard(editableBoards[draggedBoard].Origin, cursor - start, PlanScale);
         else
             pan = dragOffset + (cursor - start);
         canvas.InvalidateVisual();
@@ -553,9 +617,26 @@ public sealed class PanelView : UserControl
         original.X + (decimal)Math.Round(delta.X / scale, MidpointRounding.AwayFromZero),
         original.Y - (decimal)Math.Round(delta.Y / scale, MidpointRounding.AwayFromZero));
 
+    private int FindBoard(Point cursor)
+    {
+        if (!hasData || editableBoards.Count == 0)
+            return -1;
+        var position = Center(board) + (cursor - PlanCenter) / PlanScale;
+        for (var index = editableBoards.Count - 1; index >= 0; index--)
+            if (ToRect(editableBoards[index].Bounds).Contains(position))
+                return index;
+        return -1;
+    }
+
+    internal static CamPoint SnapBoard(CamPoint original, Vector delta, double scale) => new(
+        original.X + (decimal)Math.Round(delta.X / scale, 1, MidpointRounding.AwayFromZero),
+        original.Y - (decimal)Math.Round(delta.Y / scale, 1, MidpointRounding.AwayFromZero));
+
     private void EndPlanGesture(object sender, MouseButtonEventArgs e)
     {
         CamPoint[]? moved = null;
+        var boardIndex = draggedBoard;
+        CamPoint? boardTarget = null;
         if (draggedFiducial >= 0 && dragStart is { } start)
         {
             var target = SnapFiducial(editableFiducials[draggedFiducial], e.GetPosition(canvas) - start, PlanScale);
@@ -565,16 +646,26 @@ public sealed class PanelView : UserControl
                 moved[draggedFiducial] = target;
             }
         }
+        else if (boardIndex >= 0 && dragStart is { } boardStart)
+        {
+            var origin = editableBoards[boardIndex].Origin;
+            var target = SnapBoard(origin, e.GetPosition(canvas) - boardStart, PlanScale);
+            if (target != origin)
+                boardTarget = target;
+        }
         ClearPlanDrag();
         canvas.ReleaseMouseCapture();
         if (moved is not null)
             FiducialsMoved?.Invoke(moved);
+        if (boardTarget is { } next)
+            BoardMoved?.Invoke(boardIndex, next);
     }
 
     private void ClearPlanDrag()
     {
         dragStart = null;
         draggedFiducial = -1;
+        draggedBoard = -1;
         dragTarget = null;
         canvas.InvalidateVisual();
     }

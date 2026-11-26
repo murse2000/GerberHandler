@@ -65,27 +65,7 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
                 else if (options.RailTop > 0) AddTabs(false, source.MaxY + dy, rail.MaxY, dx, top, true, false);
             }
 
-        var outer = new Paths64 { Rectangle(panel.MinX, panel.MinY, panel.MaxX, panel.MaxY) };
-        var boardMaterial = Clipper.Union(material, FillRule.NonZero);
-        var desiredOpenings = Clipper.Difference(outer, boardMaterial, FillRule.NonZero);
-        var cutterRadius = (double)(dimensions.CutterDiameter * UnitsPerMm / 2);
-        // 공구 중심이 지나갈 수 있는 영역을 구해 탭 옆의 가공 불가능한 날카로운 모서리를 둥글린다.
-        // 선택하지 않은 레일 쪽에서는 공구가 바깥으로 나갈 수 있도록 소재 자체를 오프셋한다.
-        var rounded = Clipper.InflatePaths(Clipper.InflatePaths(boardMaterial, cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance),
-            -cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance);
-        var result = Clipper.Intersect(outer, Clipper.Union(boardMaterial, rounded, FillRule.NonZero), FillRule.NonZero);
-        var openings = Clipper.Difference(outer, result, FillRule.NonZero);
-        if (openings.Count != desiredOpenings.Count)
-            throw new InvalidDataException("설정한 공구로 가공할 수 없는 통로가 있습니다. 가공 간격이나 탭 위치 조건을 확인하세요.");
-        if (result.Count(path => Clipper.IsPositive(path)) != 1)
-            throw new InvalidDataException("라우팅 후 패널이 한 장으로 연결되지 않습니다.");
-        var holeClearance = Clipper.InflatePaths(openings, (double)(radius * UnitsPerMm) + ArcTolerance,
-            JoinType.Round, EndType.Polygon, 2, ArcTolerance);
-        if (bites.Any(point => holeClearance.Any(path => Clipper.PointInPolygon(Scale(point), path) != PointInPolygonResult.IsOutside)))
-            throw new InvalidDataException("마우스바이트가 라우팅 개구와 겹칩니다. 탭 폭과 홀 지름을 확인하세요.");
-        var lines = result.SelectMany(path => path.Select((point, index) =>
-            new CamLine(Unscale(point), Unscale(path[(index + 1) % path.Count])))).ToArray();
-        return new RoutedPanel(lines, bites, tabs);
+        return Finish(material, bites, tabs, panel, dimensions);
 
         (decimal Start, decimal End)[] EdgeRanges(bool vertical, decimal axis) => outline
             .Where(line => line.Kind == "Line" && line.Points.All(point => (vertical ? point.X : point.Y) == axis))
@@ -126,19 +106,43 @@ internal sealed record RoutedPanel(IReadOnlyList<CamLine> Profile, IReadOnlyList
         }
     }
 
+    internal static RoutedPanel Finish(Paths64 material, IReadOnlyList<CamPoint> bites, int tabs, CamBounds panel, RoutingOptions dimensions)
+    {
+        var outer = new Paths64 { Rectangle(panel.MinX, panel.MinY, panel.MaxX, panel.MaxY) };
+        var boardMaterial = Clipper.Union(material, FillRule.NonZero);
+        var desiredOpenings = Clipper.Difference(outer, boardMaterial, FillRule.NonZero);
+        var cutterRadius = (double)(dimensions.CutterDiameter * UnitsPerMm / 2);
+        // 공구가 지나갈 수 있도록 탭 옆의 안쪽 모서리를 둥글린다. 레일이 없으면 공구가 그쪽으로 빠져나갈 수 있다.
+        var rounded = Clipper.InflatePaths(Clipper.InflatePaths(boardMaterial, cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance),
+            -cutterRadius, JoinType.Round, EndType.Polygon, 2, ArcTolerance);
+        var result = Clipper.Intersect(outer, Clipper.Union(boardMaterial, rounded, FillRule.NonZero), FillRule.NonZero);
+        var openings = Clipper.Difference(outer, result, FillRule.NonZero);
+        if (openings.Count != desiredOpenings.Count)
+            throw new InvalidDataException("설정한 공구로 가공할 수 없는 통로가 있습니다. 가공 간격이나 탭 위치 조건을 확인하세요.");
+        if (result.Count(path => Clipper.IsPositive(path)) != 1)
+            throw new InvalidDataException("라우팅 후 패널이 한 장으로 연결되지 않습니다.");
+        var holeClearance = Clipper.InflatePaths(openings, (double)(dimensions.BiteDiameter * UnitsPerMm / 2) + ArcTolerance,
+            JoinType.Round, EndType.Polygon, 2, ArcTolerance);
+        if (bites.Any(point => holeClearance.Any(path => Clipper.PointInPolygon(Scale(point), path) != PointInPolygonResult.IsOutside)))
+            throw new InvalidDataException("마우스바이트가 라우팅 개구와 겹칩니다. 탭 폭과 홀 지름을 확인하세요.");
+        var lines = result.SelectMany(path => path.Select((point, index) =>
+            new CamLine(Unscale(point), Unscale(path[(index + 1) % path.Count])))).ToArray();
+        return new RoutedPanel(lines, bites, tabs);
+    }
+
     private static (decimal Start, decimal End)[] Common((decimal Start, decimal End)[] first, (decimal Start, decimal End)[] second) =>
         (from a in first from b in second select (Math.Max(a.Start, b.Start), Math.Min(a.End, b.End))).ToArray();
 
-    private static Path64 Positive(Path64 path)
+    internal static Path64 Positive(Path64 path)
     {
         if (!Clipper.IsPositive(path)) path.Reverse();
         return path;
     }
 
-    private static Path64 Rectangle(decimal x1, decimal y1, decimal x2, decimal y2) =>
+    internal static Path64 Rectangle(decimal x1, decimal y1, decimal x2, decimal y2) =>
         [Scale(new CamPoint(x1, y1)), Scale(new CamPoint(x2, y1)), Scale(new CamPoint(x2, y2)), Scale(new CamPoint(x1, y2))];
 
-    private static Point64 Scale(CamPoint point) => new(Scale(point.X), Scale(point.Y));
+    internal static Point64 Scale(CamPoint point) => new(Scale(point.X), Scale(point.Y));
     private static long Scale(decimal value) => (long)decimal.Round(value * UnitsPerMm);
     private static CamPoint Unscale(Point64 point) => new(point.X / UnitsPerMm, point.Y / UnitsPerMm);
 }

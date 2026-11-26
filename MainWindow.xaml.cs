@@ -34,6 +34,8 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         Viewer.FiducialsMoved += MoveFiducials;
+        Viewer.BoardSelected += index => MixedBoardList.SelectedIndex = index;
+        Viewer.BoardMoved += MoveMixedBoard;
         Run(() =>
         {
             if (File.Exists(PresetPath))
@@ -68,9 +70,11 @@ public partial class MainWindow : Window
 
     private void WindowDrop(object sender, DragEventArgs e)
     {
-        if (e.Data.GetData(DataFormats.FileDrop) is string[] { Length: 1 } paths)
+        if (e.Data.GetData(DataFormats.FileDrop) is string[] { Length: > 0 } paths)
         {
-            if (Path.GetExtension(paths[0]).Equals(".ghpanel", StringComparison.OrdinalIgnoreCase))
+            if (paths.Length > 1 || mixedBoards.Count > 0 && !Path.GetExtension(paths[0]).Equals(".ghpanel", StringComparison.OrdinalIgnoreCase))
+                Run(() => AddMixedBoards(paths));
+            else if (Path.GetExtension(paths[0]).Equals(".ghpanel", StringComparison.OrdinalIgnoreCase))
                 LoadProject(paths[0]);
             else
                 LoadSource(paths[0]);
@@ -108,6 +112,7 @@ public partial class MainWindow : Window
             if (input.IsPanel)
             {
                 savedLayout = null;
+                savedMixedBoards = null;
                 OpenSaved(input);
                 return;
             }
@@ -121,6 +126,11 @@ public partial class MainWindow : Window
 
     private void MapLayers(object sender, RoutedEventArgs e)
     {
+        if (mixedBoards.Count > 0)
+        {
+            StatusLabel.Text = "레이어 역할을 바꿀 보드를 단일 원본으로 연 뒤 혼합 패널에 추가하세요.";
+            return;
+        }
         var path = lastInputPath ?? source?.SourcePath ?? ChooseZip();
         if (path is null)
             return;
@@ -168,6 +178,9 @@ public partial class MainWindow : Window
 
     private void UseSource(CamInput input)
     {
+        mixedBoards = [];
+        savedMixedBoards = null;
+        RefreshMixedControls(-1);
         source = input;
         saved = null;
         savedLayout = null;
@@ -179,6 +192,8 @@ public partial class MainWindow : Window
 
     private void ReplaceSource(object sender, RoutedEventArgs e) => Run(() =>
     {
+        if (mixedBoards.Count > 0)
+            throw new InvalidDataException("혼합 배치의 보드를 교체하려면 새 보드를 추가한 뒤 기존 보드를 제거하세요.");
         RequireSource();
         if (ChooseZip() is not { } path)
             return;
@@ -206,6 +221,11 @@ public partial class MainWindow : Window
         Run(() =>
         {
             var project = Read<Project>(path);
+            if (project.Boards is { Length: > 0 })
+            {
+                LoadMixedProject(project, path);
+                return;
+            }
             var original = project.SourcePath;
             if (!File.Exists(original) && !Directory.Exists(original))
             {
@@ -286,6 +306,11 @@ public partial class MainWindow : Window
 
     private void RenderPreview(bool strictMarks)
     {
+        if (mixedBoards.Count > 0)
+        {
+            RenderMixed(mixedBoards, ReadOptions(), MixedBoardList.SelectedIndex, strictMarks);
+            return;
+        }
         var project = Snapshot();
         var input = RequireSource();
         var problem = project.Options.Routing is null ? CamEngine.VCutOutlineProblem(input) : null;
@@ -332,8 +357,18 @@ public partial class MainWindow : Window
     {
         var project = Snapshot();
         var input = RequireSource();
-        var panel = CamEngine.Build(input, project.Options);
-        ShowPanel("편집 중인 패널", panel, input, project.Options);
+        var mixing = mixedBoards.Count > 0;
+        var panel = mixing ? MixedPanel.Build(mixedBoards, project.Options) : CamEngine.Build(input, project.Options);
+        if (mixing)
+        {
+            var (bounds, _) = MixedPanel.Placement(mixedBoards, project.Options);
+            Viewer.SetMixedOutput(panel.Files, panel.Bounds, bounds, project.Options);
+            ShowLayers("혼합 패널 미리보기", panel.Files, panel.Bounds);
+            Viewer.SetEditableBoards(mixedBoards, MixedBoardList.SelectedIndex);
+            Viewer.SetEditableFiducials(panel.Fiducials);
+        }
+        else
+            ShowPanel("편집 중인 패널", panel, input, project.Options);
         if (!SetChecks(panel, project.Profile, true))
             return;
         if (panel.Warnings.Count > 0 && MessageBox.Show(this, string.Join(Environment.NewLine, panel.Warnings) +
@@ -345,7 +380,8 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog(this) != true)
             return;
 
-        if (string.Equals(Path.GetFullPath(project.SourcePath), Path.GetFullPath(dialog.FileName), StringComparison.OrdinalIgnoreCase))
+        var originals = mixing ? mixedBoards.Select(board => board.Input.SourcePath) : [project.SourcePath];
+        if (originals.Any(path => string.Equals(Path.GetFullPath(path), Path.GetFullPath(dialog.FileName), StringComparison.OrdinalIgnoreCase)))
             throw new InvalidDataException("제조 ZIP은 원본과 다른 이름으로 저장하세요.");
 
         var temporary = Path.Combine(Path.GetDirectoryName(dialog.FileName)!, $"{Guid.NewGuid():N}.zip");
@@ -364,6 +400,7 @@ public partial class MainWindow : Window
         }
 
         savedLayout = project;
+        savedMixedBoards = mixing ? mixedBoards.ToArray() : null;
         OpenSaved(CamEngine.Load(dialog.FileName));
     });
 
@@ -372,6 +409,7 @@ public partial class MainWindow : Window
         if (ChooseZip() is { } path)
         {
             savedLayout = null;
+            savedMixedBoards = null;
             OpenSaved(CamEngine.Load(path));
         }
     });
@@ -383,7 +421,13 @@ public partial class MainWindow : Window
 
         saved = input;
         var title = $"저장본 · {Path.GetFileName(input.SourcePath)}";
-        if (source is { } original && savedLayout is { } layout)
+        if (savedMixedBoards is { Count: > 0 } placements && savedLayout is { } mixedLayout)
+        {
+            var (boards, _) = MixedPanel.Placement(placements, mixedLayout.Options);
+            Viewer.SetMixedOutput(input.Files, input.Bounds, boards, mixedLayout.Options);
+            ShowLayers(title, input.Files, input.Bounds);
+        }
+        else if (mixedBoards.Count == 0 && source is { } original && savedLayout is { } layout)
         {
             var (boards, _) = CamEngine.PlacementBounds(original, layout.Options);
             Viewer.SetPanel(input.Files, input.Bounds, original.Bounds, boards, layout.Options);
@@ -391,7 +435,7 @@ public partial class MainWindow : Window
         }
         else
             ShowFiles(title, input.Files, input.Bounds);
-        if (source is not null)
+        if (source is not null && mixedBoards.Count == 0 && savedMixedBoards is null)
         {
             var options = savedLayout?.Options ?? ReadOptions();
             Cells.ItemsSource = Enumerable.Range(0, options.Rows)
@@ -403,7 +447,7 @@ public partial class MainWindow : Window
 
     private void ShowSource(object sender, RoutedEventArgs e) => Run(() =>
     {
-        var input = RequireSource();
+        var input = MixedBoardList.SelectedItem is MixedBoard board ? board.Input : RequireSource();
         ShowFiles("원본 PCB", input.Files, input.Bounds);
     });
 
@@ -589,7 +633,9 @@ public partial class MainWindow : Window
 
     private CamInput RequireSource() => source ?? throw new InvalidDataException("단일 PCB Gerber를 먼저 여세요.");
 
-    private Project Snapshot() => new(RequireSource().SourcePath, ReadOptions(), Presets.SelectedItem as Profile, roleOverrides);
+    private Project Snapshot() => new(RequireSource().SourcePath, ReadOptions(), Presets.SelectedItem as Profile, roleOverrides,
+        mixedBoards.Count == 0 ? null : mixedBoards.Select(board => new MixedPlacement(board.Input.SourcePath, board.Origin, board.RoleOverrides)).ToArray(),
+        mixedBoards.Count == 0 ? MixedPanel.DefaultGap : ReadMixedGap());
 
     private string SnapshotText() => JsonSerializer.Serialize(Snapshot(), JsonOptions);
 
@@ -705,7 +751,8 @@ public partial class MainWindow : Window
         }
     }
 
-    private sealed record Project(string SourcePath, PanelOptions Options, Profile? Profile, IReadOnlyDictionary<string, string>? RoleOverrides);
+    private sealed record Project(string SourcePath, PanelOptions Options, Profile? Profile, IReadOnlyDictionary<string, string>? RoleOverrides,
+        MixedPlacement[]? Boards = null, decimal MixedGap = MixedPanel.DefaultGap);
 
     private sealed record Cell(int Row, int Column)
     {

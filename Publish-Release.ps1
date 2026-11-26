@@ -52,7 +52,7 @@ $buildDirectory = Join-Path $PSScriptRoot "obj/release-staging/$([Guid]::NewGuid
 dotnet publish $project -c Release -r win-x64 --self-contained true "-p:Version=$Version" -o $buildDirectory
 if ($LASTEXITCODE -ne 0) { throw 'Windows 앱 빌드에 실패했습니다.' }
 
-& $packager pack --packId GerberHandler --packVersion $Version --packDir $buildDirectory --mainExe GerberHandler.exe --runtime win-x64 --channel win --releaseNotes $notes --outputDir $output
+& $packager pack --packId GerberHandler --packVersion $Version --packDir $buildDirectory --mainExe GerberHandler.exe --runtime win-x64 --channel win --releaseNotes $notes --icon (Join-Path $PSScriptRoot 'Assets/GerberHandler.ico') --outputDir $output
 if ($LASTEXITCODE -ne 0) { throw '설치 프로그램과 업데이트 패키지를 생성하지 못했습니다.' }
 
 $feed = Get-Item -LiteralPath (Join-Path $output 'releases.win.json')

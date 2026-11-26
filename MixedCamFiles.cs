@@ -1,0 +1,251 @@
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using static GerberHandler.CamEngine;
+
+namespace GerberHandler;
+
+internal static class MixedCamFiles
+{
+    private static readonly Regex CommentAttribute = new(@"^G04[ \t]+#@![ \t]+(T[FAOD](?:\.[^*]+)?\*)$");
+    private const string DrillAttribute = "; #@! TA.AperFunction,";
+
+    internal static IReadOnlyList<CamFile> Merge(IReadOnlyList<MixedBoard> boards, PanelOptions options,
+        IReadOnlyList<CamPoint> fiducials, IReadOnlyList<CamPoint> tooling, IReadOnlyList<CamPoint> bites)
+    {
+        var copper = Roles(boards[0], "Copper,");
+        var masks = Roles(boards[0], "Soldermask,");
+        foreach (var board in boards.Skip(1))
+        {
+            if (!Roles(board, "Copper,").SequenceEqual(copper))
+                throw new InvalidDataException("혼합 제조 ZIP의 모든 보드는 같은 동박 스택과 레이어 순서가 필요합니다.");
+            if (!Roles(board, "Soldermask,").SequenceEqual(masks))
+                throw new InvalidDataException("혼합 제조 ZIP의 모든 보드는 같은 면의 솔더마스크 레이어가 필요합니다.");
+        }
+        if (fiducials.Count > 0 && !masks.Contains("Soldermask,Top"))
+            throw new InvalidDataException("피두셜을 만들려면 상면 솔더마스크가 필요합니다.");
+
+        var files = new List<CamFile>();
+        var sources = boards.SelectMany((board, index) => board.Input.Files.Select(file => (File: file, board.Offset, Index: index + 1)))
+            .Where(item => !item.File.Role.StartsWith("Profile", StringComparison.Ordinal) && item.File.Role != "Vcut");
+        foreach (var layer in sources.Where(item => !item.File.IsDrill).GroupBy(item => item.File.Role))
+            files.Add(MergeGerber(layer.Key, layer, options, fiducials));
+        var drills = sources.Where(item => item.File.IsDrill).ToLookup(item => item.File.Role);
+        foreach (var role in new[] { $"Plated,1,{copper.Length},PTH", $"NonPlated,1,{copper.Length},NPTH" })
+        {
+            var isNonPlated = role.StartsWith("NonPlated,", StringComparison.Ordinal);
+            if (drills.Contains(role) || isNonPlated && (tooling.Count > 0 || bites.Count > 0))
+                files.Add(MergeDrill(role, drills[role], isNonPlated ? tooling : [], isNonPlated ? bites : [], options));
+        }
+        return files;
+    }
+
+    private static string[] Roles(MixedBoard board, string prefix) => board.Input.Files.Select(file => file.Role)
+        .Where(role => role.StartsWith(prefix, StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToArray();
+
+    private static CamFile MergeGerber(string role, IEnumerable<(CamFile File, CamPoint Offset, int Index)> items,
+        PanelOptions options, IReadOnlyList<CamPoint> fiducials)
+    {
+        var sources = items.Select(item =>
+        {
+            _ = Geometry(item.File);
+            var commands = Commands(item.File.Text).Select(ExpandCommentAttribute).ToArray();
+            var format = commands.Select(command => GerberFormat.Match(command)).First(match => match.Success);
+            var polarity = GerberAttribute(item.File.Text, "FilePolarity");
+            if (polarity is not ("Positive" or "Negative"))
+            {
+                if (role.StartsWith("Soldermask,", StringComparison.Ordinal) || polarity.Length != 0)
+                    throw Bad(item.File, "솔더마스크 또는 파일 극성을 확인할 수 없습니다.");
+                polarity = "Positive";
+            }
+            return (item, commands, format, polarity);
+        }).ToArray();
+        var filePolarity = sources[0].polarity;
+        if (sources.Any(source => source.polarity != filePolarity))
+            throw new InvalidDataException($"{role}: 서로 다른 파일 극성의 레이어는 병합할 수 없습니다.");
+        if (filePolarity == "Negative" && !role.StartsWith("Soldermask,", StringComparison.Ordinal))
+            throw new InvalidDataException($"{role}: 음극성 레이어는 솔더마스크만 혼합할 수 있습니다.");
+
+        var whole = Math.Max(4, sources.Max(s => Math.Max(GroupInt(s.format, 1), GroupInt(s.format, 3))));
+        var precision = Math.Max(6, sources.Max(s => Math.Max(GroupInt(s.format, 2), GroupInt(s.format, 4))));
+        string Position(decimal value) => GerberPosition(value, whole, precision);
+
+        var definitions = new StringBuilder();
+        var objects = new StringBuilder();
+        var macros = new Dictionary<string, string>(StringComparer.Ordinal);
+        var nextDCode = 10;
+        // 파일별 플로터 상태를 초기화하고, 정의와 그리기를 각각 합친다.
+        foreach (var (item, commands, format, _) in sources)
+        {
+            var apertureCodes = new Dictionary<int, int>();
+            var attributes = new Dictionary<string, string>(StringComparer.Ordinal);
+            var objectAttributes = new HashSet<string>(StringComparer.Ordinal);
+            decimal? x = null, y = null;
+            var sx = Scale(GroupInt(format, 2));
+            var sy = Scale(GroupInt(format, 4));
+            objects.AppendLine("%TD*%").AppendLine("%LPD*%").AppendLine("G01*");
+            foreach (var command in commands)
+            {
+                if (command.StartsWith("%SR", StringComparison.Ordinal))
+                    throw Bad(item.File, "이미 반복 블록이 들어 있는 Gerber는 혼합할 수 없습니다.");
+                if (command.StartsWith("G04", StringComparison.Ordinal) || command.StartsWith("%TF.", StringComparison.Ordinal) ||
+                    GerberFormat.IsMatch(command) || command is "M02*" or "%MOMM*%")
+                    continue;
+                if (command.StartsWith("%AM", StringComparison.Ordinal))
+                {
+                    var nameEnd = command.IndexOf('*');
+                    var name = command[3..nameEnd];
+                    var body = string.Concat(command[(nameEnd + 1)..^1].Split('*', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                        .Where(part => !part.StartsWith("0 ", StringComparison.Ordinal)).Select(part => string.Concat(part.Where(c => !char.IsWhiteSpace(c))) + "*"));
+                    if (macros.TryAdd(name, body))
+                        definitions.AppendLine(command);
+                    else if (macros[name] != body)
+                        throw Bad(item.File, $"서로 다른 정의가 같은 아퍼처 매크로 이름을 사용합니다. {name}");
+                    continue;
+                }
+                if (command.StartsWith("%TA.", StringComparison.Ordinal))
+                {
+                    attributes[AttributeName(command)] = command;
+                    // 리전은 별도 아퍼처 없이 현재 TA 속성을 직접 사용한다.
+                    objects.AppendLine(command);
+                    continue;
+                }
+                if (command.StartsWith("%TD", StringComparison.Ordinal))
+                {
+                    if (command == "%TD*%")
+                    {
+                        attributes.Clear();
+                        objectAttributes.Clear();
+                        objects.AppendLine(command);
+                    }
+                    else
+                    {
+                        var name = AttributeName(command);
+                        var apertureAttribute = attributes.Remove(name);
+                        if (objectAttributes.Remove(name) || apertureAttribute) objects.AppendLine(command);
+                    }
+                    continue;
+                }
+                if (Aperture.Match(command) is { Success: true } aperture)
+                {
+                    var original = GroupInt(aperture, 1);
+                    var assigned = nextDCode++;
+                    apertureCodes.Add(original, assigned);
+                    definitions.AppendLine("%TD*%");
+                    foreach (var attribute in attributes.Values)
+                        definitions.AppendLine(attribute);
+                    definitions.AppendLine($"%ADD{assigned}{command[(aperture.Groups[1].Index + aperture.Groups[1].Length)..]}");
+                    definitions.AppendLine("%TD*%");
+                    continue;
+                }
+                if (command.Length > 2 && command[0] == 'D' &&
+                    int.TryParse(command.AsSpan(1, command.Length - 2), NumberStyles.None, CultureInfo.InvariantCulture, out var dcode))
+                {
+                    objects.AppendLine(apertureCodes.TryGetValue(dcode, out var mapped) ? $"D{mapped}*"
+                        : throw Bad(item.File, $"정의되지 않은 아퍼처 D{dcode}입니다."));
+                    continue;
+                }
+                if (Operation.Match(command) is { Success: true } operation)
+                {
+                    var g = operation.Groups;
+                    x = g[2].Success ? Number(g[2].Value) / sx : x;
+                    y = g[3].Success ? Number(g[3].Value) / sy : y;
+                    if (x is null || y is null)
+                        throw Bad(item.File, "첫 Gerber 작업의 X/Y 좌표가 모두 필요합니다.");
+                    objects.Append(g[1].Value).Append('X').Append(Position(x.Value + item.Offset.X))
+                        .Append('Y').Append(Position(y.Value + item.Offset.Y));
+                    if (g[4].Success) objects.Append('I').Append(Position(Number(g[4].Value) / sx));
+                    if (g[5].Success) objects.Append('J').Append(Position(Number(g[5].Value) / sy));
+                    objects.AppendLine($"D0{g[6].Value}*");
+                    continue;
+                }
+                // 한 보드의 넷 이름과 RefDes가 다른 보드에 연결되지 않게 한다.
+                if (command.StartsWith("%TO.", StringComparison.Ordinal)) objectAttributes.Add(AttributeName(command));
+                objects.AppendLine(PrefixObject(command, $"B{item.Index}_"));
+            }
+        }
+
+        if (fiducials.Count > 0 && role is "Copper,L1,Top" or "Soldermask,Top")
+        {
+            var copper = role == "Copper,L1,Top";
+            if (!copper && filePolarity != "Negative")
+                throw new InvalidDataException("피두셜 개구를 추가하려면 음극성 상면 솔더마스크가 필요합니다.");
+            if (copper) definitions.AppendLine("%TA.AperFunction,FiducialPad,Panel*%");
+            definitions.AppendLine($"%ADD{nextDCode}C,{DecimalText(copper ? options.FiducialDiameter : options.MaskDiameter)}*%");
+            definitions.AppendLine("%TD*%");
+            objects.AppendLine("%TD*%").AppendLine("%LPD*%").AppendLine("G01*").AppendLine($"D{nextDCode}*");
+            if (copper) objects.AppendLine("%TO.N,*%");
+            foreach (var point in fiducials)
+                objects.AppendLine($"X{Position(point.X)}Y{Position(point.Y)}D03*");
+            objects.AppendLine("%TD*%");
+        }
+
+        var output = new StringBuilder().AppendLine("%TF.GenerationSoftware,GerberHandler,GerberHandler*%")
+            .AppendLine("%TF.Part,Array*%").AppendLine($"%TF.FileFunction,{role}*%").AppendLine($"%TF.FilePolarity,{filePolarity}*%")
+            .AppendLine($"%FSLAX{whole}{precision}Y{whole}{precision}*%").AppendLine("%MOMM*%")
+            .Append(definitions).Append(objects).AppendLine("M02*");
+        return new CamFile($"panel-{role.Replace(',', '-')}.gbr", role, output.ToString(), false);
+    }
+
+    private static CamFile MergeDrill(string role, IEnumerable<(CamFile File, CamPoint Offset, int Index)> sources,
+        IReadOnlyList<CamPoint> tooling, IReadOnlyList<CamPoint> bites, PanelOptions options)
+    {
+        var plated = role.StartsWith("Plated,", StringComparison.Ordinal);
+        var classification = plated ? "Plated,PTH" : "NonPlated,NPTH";
+        var header = new StringBuilder().AppendLine("M48").AppendLine("; FORMAT={-:-/ absolute / metric / decimal}")
+            .AppendLine("; #@! TF.GenerationSoftware,GerberHandler,GerberHandler").AppendLine($"; #@! TF.FileFunction,{role}")
+            .AppendLine("FMAT,2").AppendLine("METRIC");
+        var hits = new StringBuilder();
+        var nextTool = 1;
+        foreach (var (file, offset, _) in sources)
+        {
+            var data = ReadDrill(file.Text);
+            var toolFunctions = new Dictionary<int, string>();
+            string? function = null;
+            foreach (var line in data.Header)
+            {
+                if (line.StartsWith(DrillAttribute, StringComparison.Ordinal))
+                {
+                    function = line[DrillAttribute.Length..];
+                    if (!function.StartsWith(classification + ",", StringComparison.Ordinal) && function != classification)
+                        throw Bad(file, "드릴 도구의 도금 정보가 파일 역할과 다릅니다.");
+                }
+                else if (Tool.Match(line) is { Success: true } match && function is not null)
+                {
+                    toolFunctions.Add(GroupInt(match, 1), function);
+                    function = null;
+                }
+            }
+            foreach (var (id, diameter) in data.Tools)
+                AddTool(diameter, toolFunctions.GetValueOrDefault(id), data.Hits.Where(hit => hit.Id == id)
+                    .Select(hit => new CamPoint(hit.Point.X + offset.X, hit.Point.Y + offset.Y)));
+        }
+        AddTool(options.ToolingDiameter, "NonPlated,NPTH,MechanicalDrill,Tooling", tooling);
+        AddTool(options.Routing?.BiteDiameter ?? 0, "NonPlated,NPTH,MechanicalDrill", bites);
+        return new CamFile(plated ? "panel-PTH.drl" : "panel-NPTH.drl", role,
+            header.AppendLine("%").AppendLine("G90").AppendLine("G05").Append(hits).AppendLine("M30").ToString(), true);
+
+        void AddTool(decimal diameter, string? function, IEnumerable<CamPoint> points)
+        {
+            var toolPoints = points.ToArray();
+            if (toolPoints.Length == 0)
+                return;
+            if (function is not null)
+                header.AppendLine(DrillAttribute + function);
+            else
+                header.AppendLine("; #@! TD.AperFunction");
+            header.AppendLine($"T{nextTool}C{DecimalText(diameter)}");
+            hits.AppendLine($"T{nextTool++}");
+            foreach (var coordinate in toolPoints)
+                hits.AppendLine($"X{DecimalText(coordinate.X)}Y{DecimalText(coordinate.Y)}");
+        }
+    }
+
+    private static int GroupInt(Match match, int group) => int.Parse(match.Groups[group].ValueSpan, CultureInfo.InvariantCulture);
+    private static string AttributeName(string command) => command[4..].Split(',', '*')[0];
+    private static string DecimalText(decimal value) => value.ToString("0.0###########################", CultureInfo.InvariantCulture);
+    private static string ExpandCommentAttribute(string command) => CommentAttribute.Match(command) is { Success: true } match
+        ? $"%{match.Groups[1].Value}%" : command;
+    private static InvalidDataException Bad(CamFile file, string message) => new($"{file.Name}: {message}");
+}

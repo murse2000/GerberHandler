@@ -51,11 +51,11 @@ public static class CamEngine
     private static readonly CultureInfo Invariant = CultureInfo.InvariantCulture;
     private static readonly UTF8Encoding Utf8 = new(false, true);
     private static readonly Regex Command = new(@"\G\s*(%[^%]+%|[^%*]+\*)", RegexOptions.CultureInvariant);
-    private static readonly Regex GerberFormat = new(@"^%FSLAX([1-6])([1-7])Y([1-6])([1-7])\*%$", RegexOptions.CultureInvariant);
-    private static readonly Regex Aperture = new(@"^%ADD(\d+)([A-Za-z_][A-Za-z0-9_.-]*)(?:,([^*]+))?\*%$", RegexOptions.CultureInvariant);
-    private static readonly Regex Operation = new(@"^(?:(G0[123]))?(?:X([+-]?\d+))?(?:Y([+-]?\d+))?(?:I([+-]?\d+))?(?:J([+-]?\d+))?D0([123])\*$", RegexOptions.CultureInvariant);
+    internal static readonly Regex GerberFormat = new(@"^%FSLAX([1-6])([1-7])Y([1-6])([1-7])\*%$", RegexOptions.CultureInvariant);
+    internal static readonly Regex Aperture = new(@"^%ADD(\d+)([A-Za-z_][A-Za-z0-9_.-]*)(?:,([^*]+))?\*%$", RegexOptions.CultureInvariant);
+    internal static readonly Regex Operation = new(@"^(?:(G0[123]))?(?:X([+-]?\d+))?(?:Y([+-]?\d+))?(?:I([+-]?\d+))?(?:J([+-]?\d+))?D0([123])\*$", RegexOptions.CultureInvariant);
     private static readonly Regex Repeat = new(@"^%SRX(\d+)Y(\d+)I([\d.]+)J([\d.]+)\*%$", RegexOptions.CultureInvariant);
-    private static readonly Regex Tool = new(@"^T(\d+)C([\d.]+)$", RegexOptions.CultureInvariant);
+    internal static readonly Regex Tool = new(@"^T(\d+)C([\d.]+)$", RegexOptions.CultureInvariant);
     private static readonly Regex Hit = new(@"^X([+-]?\d+(?:\.\d+)?)Y([+-]?\d+(?:\.\d+)?)$", RegexOptions.CultureInvariant);
     private static readonly Regex Coord = new(@"([XY])([+-]?\d+)", RegexOptions.CultureInvariant);
     private const int MaxCopies = 100;
@@ -403,7 +403,7 @@ public static class CamEngine
             .SelectMany(index => new[] { min + index * pitch, max + index * pitch }).Distinct();
     }
 
-    private static List<CamPoint> Marks(CamBounds panel, CamBounds boards, IReadOnlyList<CamLine> cuts,
+    internal static List<CamPoint> Marks(CamBounds panel, CamBounds boards, IReadOnlyList<CamLine> cuts,
         decimal clearance, decimal radius, IReadOnlyList<CamPoint>? manual, List<(CamPoint Point, decimal Radius)> occupied)
     {
         bool Fits(CamPoint point)
@@ -496,7 +496,7 @@ public static class CamEngine
         }
     }
 
-    private static IEnumerable<string> Commands(string source)
+    internal static IEnumerable<string> Commands(string source)
     {
         var index = 0;
         foreach (Match match in Command.Matches(source))
@@ -814,12 +814,12 @@ public static class CamEngine
         return shape with { Points = Move(shape.Points), Contours = shape.Contours?.Select(Move).ToArray() };
     }
 
-    private static decimal Scale(int precision) => (decimal)Math.Pow(10, precision);
+    internal static decimal Scale(int precision) => (decimal)Math.Pow(10, precision);
 
-    private sealed record DrillData(string[] Header, IReadOnlyDictionary<int, decimal> Tools,
+    internal sealed record DrillData(string[] Header, IReadOnlyDictionary<int, decimal> Tools,
         IReadOnlyList<(int Id, CamPoint Point)> Hits);
 
-    private static DrillData ReadDrill(string source)
+    internal static DrillData ReadDrill(string source)
     {
         var lines = source.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
         var tools = new Dictionary<int, decimal>();
@@ -1017,7 +1017,7 @@ public static class CamEngine
         return output.AppendLine("M02*").ToString();
     }
 
-    private static string PrefixObject(string command, string prefix)
+    internal static string PrefixObject(string command, string prefix)
     {
         if (!command.StartsWith("%TO.", StringComparison.Ordinal))
             return command;
@@ -1033,7 +1033,7 @@ public static class CamEngine
         return string.Join(',', parts) + "*%";
     }
 
-    private static string GerberPosition(decimal coordinate, int whole, int precision)
+    internal static string GerberPosition(decimal coordinate, int whole, int precision)
     {
         var scaled = coordinate * Scale(precision);
         if (decimal.Truncate(scaled) != scaled || Math.Abs(scaled) >= Scale(whole + precision))
@@ -1041,7 +1041,7 @@ public static class CamEngine
         return scaled.ToString("0", Invariant);
     }
 
-    private static CamFile LineFile(string name, string role, IEnumerable<CamLine> lines)
+    internal static CamFile LineFile(string name, string role, IEnumerable<CamLine> lines)
     {
         var output = new StringBuilder();
         output.AppendLine("%TF.GenerationSoftware,GerberHandler,GerberHandler*%")
@@ -1056,6 +1056,6 @@ public static class CamEngine
 
     private static string DrillKind(string role) => role.StartsWith("NonPlated,", StringComparison.Ordinal) ? "NPTH" : "PTH";
     private static string Format(decimal value) => value.ToString("0.###########", Invariant);
-    private static decimal Number(string value) => decimal.Parse(value, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint, Invariant);
+    internal static decimal Number(string value) => decimal.Parse(value, NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint, Invariant);
     private static InvalidDataException Bad(string message) => new(message);
 }

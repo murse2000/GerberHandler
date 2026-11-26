@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:GerberHandler"
-        Title="GerberHandler" Width="1350" Height="820" MinWidth="940" MinHeight="610"
+        Title="GerberHandler" Width="1350" Height="820" MinWidth="940" MinHeight="610" Icon="Assets/GerberHandler.ico"
         Background="#e9ece9" FontFamily="Malgun Gothic" AllowDrop="True"
         DragOver="WindowDragOver" Drop="WindowDrop" Closing="WindowClosing" Loaded="WindowLoaded">
     <DockPanel>
@@ -10,6 +10,8 @@
             <MenuItem Header="파일(_F)">
                 <MenuItem Header="Gerber ZIP 열기" Click="OpenZip" />
                 <MenuItem Header="Gerber 폴더 열기" Click="OpenFolder" />
+                <MenuItem Header="혼합 패널에 ZIP 추가" Click="AddBoardZips" />
+                <MenuItem Header="혼합 패널에 폴더 추가" Click="AddBoardFolder" />
                 <MenuItem Header="입력 파일 역할 지정" Click="MapLayers" />
                 <Separator />
                 <MenuItem Header="프로젝트 열기" Click="OpenProject" />
@@ -29,6 +31,7 @@
             <DockPanel>
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                     <Button Content="Gerber 열기" Click="OpenZip" />
+                    <Button Content="다른 보드 추가" Click="AddBoardZips" />
                     <Button Content="패널 미리보기" Click="BuildPanel" />
                     <Button Content="제조 ZIP 저장" Click="SavePanel" Background="#b8dfa8" />
                 </StackPanel>
@@ -69,12 +72,27 @@
             </DockPanel>
             <ScrollViewer Grid.Column="2" Margin="8,0,0,0" Background="#f5f6f3" VerticalScrollBarVisibility="Auto">
                 <StackPanel Margin="12,7">
+                    <StackPanel x:Name="MixedControls" Visibility="Collapsed">
+                        <TextBlock Text="혼합 배치" FontSize="16" FontWeight="Bold" />
+                        <ListBox x:Name="MixedBoardList" DisplayMemberPath="Caption" SelectionChanged="MixedSelectionChanged" MaxHeight="120" />
+                        <WrapPanel>
+                            <Button Content="가로로 정렬" Click="ArrangeMixedHorizontal" />
+                            <Button Content="세로로 정렬" Click="ArrangeMixedVertical" />
+                            <Button Content="선택 보드 제거" Click="RemoveMixedBoard" />
+                        </WrapPanel>
+                        <DockPanel Margin="0,0,0,5">
+                            <TextBox x:Name="MixedGap" Text="5" Width="48" DockPanel.Dock="Right" />
+                            <TextBlock Text="자동 정렬 간격 (mm)" VerticalAlignment="Center" />
+                        </DockPanel>
+                        <TextBlock Text="2D에서 보드를 클릭해 선택하고 끌어서 옮기세요." TextWrapping="Wrap" Margin="0,0,0,6" />
+                        <Separator />
+                    </StackPanel>
                     <TextBlock Text="배열과 레일" FontSize="16" FontWeight="Bold" />
                     <UniformGrid Columns="2" Margin="0,5">
-                        <StackPanel Margin="0,0,8,0"><TextBlock Text="행 (Y)" /><TextBox x:Name="Rows" Text="1" /></StackPanel>
-                        <StackPanel><TextBlock Text="열 (X)" /><TextBox x:Name="Columns" Text="1" /></StackPanel>
-                        <StackPanel Margin="0,0,8,0"><TextBlock Text="행 간격 (mm)" /><TextBox x:Name="RowGap" Text="0" /></StackPanel>
-                        <StackPanel><TextBlock Text="열 간격 (mm)" /><TextBox x:Name="ColumnGap" Text="0" /></StackPanel>
+                        <StackPanel x:Name="SingleRows" Margin="0,0,8,0"><TextBlock Text="행 (Y)" /><TextBox x:Name="Rows" Text="1" /></StackPanel>
+                        <StackPanel x:Name="SingleColumns"><TextBlock Text="열 (X)" /><TextBox x:Name="Columns" Text="1" /></StackPanel>
+                        <StackPanel x:Name="SingleRowGap" Margin="0,0,8,0"><TextBlock Text="행 간격 (mm)" /><TextBox x:Name="RowGap" Text="0" /></StackPanel>
+                        <StackPanel x:Name="SingleColumnGap"><TextBlock Text="열 간격 (mm)" /><TextBox x:Name="ColumnGap" Text="0" /></StackPanel>
                         <StackPanel Margin="0,0,8,0"><CheckBox x:Name="EnableLeftRail" Content="왼쪽 레일 (mm)" IsChecked="True" /><TextBox x:Name="RailLeft" Text="5" IsEnabled="{Binding IsChecked, ElementName=EnableLeftRail}" /></StackPanel>
                         <StackPanel><CheckBox x:Name="EnableRightRail" Content="오른쪽 레일 (mm)" IsChecked="True" /><TextBox x:Name="RailRight" Text="5" IsEnabled="{Binding IsChecked, ElementName=EnableRightRail}" /></StackPanel>
                         <StackPanel Margin="0,0,8,0"><CheckBox x:Name="EnableBottomRail" Content="아래 레일 (mm)" IsChecked="True" /><TextBox x:Name="RailBottom" Text="5" IsEnabled="{Binding IsChecked, ElementName=EnableBottomRail}" /></StackPanel>
@@ -129,7 +147,7 @@
                     <TextBlock x:Name="PresetLabel" Text="제조 ZIP을 저장하려면 확인한 제조 조건을 선택하세요." TextWrapping="Wrap" />
                     <Separator Margin="0,8,0,3" />
                     <TextBlock Text="저장본 비교" FontSize="16" FontWeight="Bold" />
-                    <WrapPanel Margin="0,5,0,0">
+                    <WrapPanel x:Name="CompareControls" Margin="0,5,0,0">
                         <ComboBox x:Name="Cells" MinWidth="122" Margin="0,3,6,3" />
                         <Button Content="원본과 비교" Click="CompareCell" />
                     </WrapPanel>

@@ -1,6 +1,6 @@
 # GerberHandler
 
-GerberHandler는 KiCad에서 내보낸 단일 PCB 제조 파일로 V-cut 패널을 만들고 결과를 2D와 3D로 검토하는 Windows x64 앱입니다.
+GerberHandler는 KiCad에서 내보낸 PCB 제조 파일로 단일 보드 배열 또는 혼합 패널을 만들고 2D와 3D로 검토하는 Windows x64 앱입니다.
 
 ## 설치와 사용
 
@@ -18,6 +18,12 @@ GerberHandler는 KiCad에서 내보낸 단일 PCB 제조 파일로 V-cut 패널�
 제조·조립 조건 목록에서 **Eurocircuits 조립 · 공개 조건 참고**를 바로 선택할 수 있습니다. 프리셋 등록 화면에는 이 참고값을 자동으로 채우고, **현재 마크 치수 사용**으로 작업 중인 피두셜과 홀 치수를 가져올 수 있습니다. 최종 값은 주문할 업체의 사양에 맞춰 적용하세요. [패널 크기·레일·절단](https://www.eurocircuits.com/technical-guidelines/panel-guidelines/customer-panel-basics/) · [동박 이격](https://www.eurocircuits.com/copper-and-the-board-edge/) · [피두셜 치수](https://www.eurocircuits.com/tips-tricks/finding-fiducials/) · [고정 홀](https://www.eurocircuits.com/technical-guidelines/panel-guidelines/ec-panel-by-eurocircuits/)
 
 **패널 미리보기**의 2D 탭에서 노란 원으로 표시된 피두셜을 끌면 기존 위치를 기준으로 X·Y가 각각 1 mm 단위로 이동합니다. 레일 밖이거나 다른 피처와 충돌하는 위치는 이전 좌표로 복원합니다. 자동 배치로 돌아가려면 피두셜 좌표 칸을 비우고 미리보기를 다시 누르세요.
+
+## 크기가 다른 보드 배치
+
+**다른 보드 추가**에서 단일 보드 Gerber ZIP을 여러 개 선택하거나, **파일 → 혼합 패널에 폴더 추가**로 폴더를 추가합니다. 2D 화면에서 보드를 클릭해 선택하고 끌면 0.1 mm 단위로 움직입니다. 오른쪽에서 원하는 간격으로 가로·세로 정렬하거나 선택한 보드를 제거할 수 있습니다. `.ghpanel`에 원본 경로, 배치 간격과 좌표가 저장됩니다.
+
+혼합 배치의 제조 ZIP은 **탭 라우팅 + 마우스바이트**에서 지원합니다. 동박층과 솔더마스크 레이어 구성이 호환되고, 마주 보는 직선 외곽에 물리적으로 연결 탭을 배치할 수 있어야 합니다. 보드들의 기판 재질·두께·적층 제작 조건은 주문 전에 확인하세요. 저장본은 2D와 3D로 열 수 있고, 배열 셀별 원본 비교는 단일 보드 배열에서 제공됩니다.
 
 ## 업데이트
 

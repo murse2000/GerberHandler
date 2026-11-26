@@ -5,14 +5,16 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <Version>0.1.5</Version>
+    <Version>0.2.0</Version>
     <Product>GerberHandler</Product>
     <AssemblyName>GerberHandler</AssemblyName>
     <StartupObject>GerberHandler.Program</StartupObject>
+    <ApplicationIcon>Assets/GerberHandler.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Velopack" Version="1.2.161" />
     <PackageReference Include="Clipper2" Version="2.0.0" />
+    <Resource Include="Assets/GerberHandler.ico" />
     <Compile Remove="tests/**/*.cs" />
   </ItemGroup>
 </Project>
